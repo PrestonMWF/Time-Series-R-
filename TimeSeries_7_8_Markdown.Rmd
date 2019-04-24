@@ -1,0 +1,1217 @@
+---
+title: "Chicago Mercantile Exchange Seat Price Forecasting"
+author: "Mark Preston"
+date: "December 5, 2018"
+output:
+  html_document:
+    fig_height: 6.5
+    fig_width: 10.5
+  word_document: default
+---
+
+***
+
+##Assignment 7: CME Monthly Seat Cleaning
+
+***
+
+###CME Data Introduction
+
+Starting a two-part assignment, I'll be working with Chicago Mercantile Exchange (CME) seat pricing data. The CME is the largest options trading exchange in the world. Part of their revenue comes from selling seats in the exchange, which allows buyers to sell different types of commodities and see order books at the CME. Of note, it's important to point out that owning a CME seat only provides an advantage to floor trading. In contrast, owning a CME seat does not have any advantage for electronic trading. Since electronic trading constitutes market participants trading directly with other participants via CME's network connections and order matching engine.
+
+These seats also have different classes. CME seat owners can trade everything, IMM seat owners are allowed to trade everything except agricultural products, and IOM seat owners are only allowed to trade index products and all options. Given this, the seats are sought after and expensive.
+
+In the first part, I'm going to develop a function to clean three data sets focusing on each class of seat. Ultimately, I'll work to make a set for each seat so that every month from January 2001 to December 2013 is individual represented. Here, each month in 2013 will be the forecast period (frequency = 12). 
+
+To start this task, I've loaded all three sets. During the load, I noticed the IOM set had missing value indicators from the csv so I replaced the with the correct month and year.
+
+```{r loading data and packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(forecast)
+library(tseries)
+library(rugarch)
+library(lubridate)
+library(corrplot)
+library(Metrics)
+library(car)
+library(gridExtra)
+library(kableExtra)
+library(knitr)
+
+theme_set(
+  theme_minimal()
+)
+
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+cme <- read.csv("cmeS.csv", stringsAsFactors = F)
+
+imm <- read.csv("immS.csv", stringsAsFactors = F)
+
+iom <- read.csv("iomS.csv", stringsAsFactors = F, na.strings = "#VALUE!") %>%
+  mutate(Year = ifelse(is.na(Year), 2008, Year),
+         Month = ifelse(is.na(Year), 2008, Month))
+```
+
+***
+
+###CME Data Exploration
+
+Each set has the same number of columns but, different rows. The initial forecasting question is concerned with having one value per month over the 13 year time span, which amount to 156 observations. This indicates that there are definitely more than one seat sale per month over the recorded observations. However, it's unclear which months might be absent. With this in mind, numerous sales in one month have to be unified into a single value while any missing points have to be imputed.
+
+```{r seat set dimensions}
+data.frame(
+  set = c("CME", "IMM", "IOM"),
+  rows = c(dim(cme)[1], dim(imm)[1], dim(iom)[1]),
+  columns = c(dim(cme)[2], dim(imm)[2], dim(iom)[2])
+) %>% custom_kable()
+```
+
+Getting further into the data, I've included a summary from the cme set. It shows that there are indeed numerous sales per month, and by date as well. This is the first look at pricing as well, which highlights cme seats ranging from 188,000 to 1,575,000 dollars.
+
+```{r summary of cme set}
+cme %>%
+  mutate_if(is.character, as.factor) %>%
+  summary() %>%
+  custom_kable()
+```
+
+The summary prompted a closer review of the price distribution per set. It appeared cme was positively skewed so I wanted to visualize the set to confirm the thinking. As seen, all the sets are positively skewed. While this doesn't show any nuanced monthly price swings, I think it supports using median imputation, if necessary, because using an average might yield inflated monthly values. As such, during any imputation work, I'll use median.   
+
+```{r all seat prices}
+data.frame(
+  seat = c(rep("CME", nrow(cme)), rep("IMM", nrow(imm)), rep("IOM", nrow(iom))),
+  prices = c(cme$price, imm$price, iom$price)
+) %>%
+  ggplot(aes(prices, fill = seat)) +
+  geom_histogram(bins = 35, show.legend = F) +
+  facet_wrap(facets = "seat", scales = "free") +
+  scale_x_continuous(labels = scales::dollar_format(prefix = "$")) +
+  labs(title = "Seat prices from CME, IME, and IOM",
+       subtitle = "All distributions appear positively skewed- median imputation seems like a reasonable choice")
+```
+
+Before the cleaning and imputation function, I wanted to look at one set in more detail to better understand what months might be missing. For this, I'm grouping IMM by year and month and summarizing the number of sales and median seat price for the entry. To make this more manageable, I'm taking the first year (2001) for review.
+
+The table highlights that there are indeed months without any sales. For example, both April and August do not have seat price data here. Conversely, several months have more than one sale, including four in January. Again, I've summarized the multiple sales using median price. Overall, this means I'll have to both summarize and impute data.
+
+```{r sales summary example}
+imm %>%
+  group_by(Year, Month) %>%
+  summarise(sales_per_month = n(),
+            median_price = median(price)) %>%
+  filter(Year == 2001) %>%
+  custom_kable()
+```
+
+***
+
+###Imputation and Cleaning: Function and final set development 
+
+Since each set has the same column structure, the same imputation process can be duplicated. With this in mind, developing a cleaning function makes sense. The first step here comes from the previous chunk where each set's sales are summarized by year and month. This unifies several sales in one month into a single value but, inherently leaves missing months unattended. To counter this, the function develops a data frame with all the necessary year and month entries, which is then joined with the sales by year and month. Using a left join yields missing values in the new set where there aren't any monthly sales. These missing values are then be filled using median imputation. 
+
+With the function developed, I'm using it on each set. The first five rows from the IOM result can be seen below. There are four columns covering the year, month, and median seat price for the entry. Additionally, I wanted to ensure I could review which values were imputed so I included a marker for this. The rationale here is seeing how the new imputed values look to ensure they aren't erratic and the cleaning was performed well.
+
+```{r developing imputation function}
+mercantile_impute <- function(set){
+  set_sales <- set %>%
+    group_by(Year, Month) %>%
+    summarise(median_price = median(price))
+  
+  exchange_dates <- data.frame(
+    Year = rep(c(2001:2013), each = 12),
+    Month = rep(c(1:12), times = 13)
+  )
+  
+  set_imputation <- exchange_dates %>%
+    left_join(x = ., y = set_sales, by = c("Year", "Month")) %>%
+    mutate(value_provenance = ifelse(!is.na(median_price), "original", "imputed"))
+  
+  set_yearly_prices <- set_imputation %>%
+    filter(!is.na(median_price)) %>%
+    group_by(Year) %>%
+    summarise(median_price = median(median_price))
+  
+  set_final <- set_imputation %>%
+    filter(is.na(median_price)) %>%
+    select(-median_price) %>%
+    left_join(x = ., y = set_yearly_prices, by = "Year")
+  
+  set_final <- set_imputation %>%
+    filter(!is.na(median_price)) %>%
+    bind_rows(set_final) %>%
+    arrange(Year, Month)
+  
+  return(set_final)
+}
+
+cme_imputation <- mercantile_impute(set = cme)
+
+imm_imputation <- mercantile_impute(set = imm)
+
+iom_imputation <- mercantile_impute(set = iom)
+
+iom_imputation %>%
+  head() %>%
+  custom_kable()
+```
+
+This cleaning yields three new sets, each of which have identical structure. There are individual entries for each month by year (13 years * 12 months = 156 records) so the general parameters for the forecasting portion are set.
+
+```{r seat set dimensions for imputation sets}
+data.frame(
+  set = c("CME", "IMM", "IOM"),
+  rows = c(dim(cme_imputation)[1], dim(imm_imputation)[1], dim(iom_imputation)[1]),
+  columns = c(dim(cme_imputation)[2], dim(imm_imputation)[2], dim(iom_imputation)[2])
+) %>% custom_kable()
+```
+
+***
+
+###Secondary Data Exploration
+
+With the imputation sets developed, I wanted to explore them more thoroughly with a concerted focus on the imputation values. Again, since each set has the same structure, I'm economizing on code length by developing a visualization function ahead of time. This function has three output options, which I'll include for every set.
+
+```{r visualiztion and summary function development}
+mercantile_viz <- function(set, viz){
+  name <- deparse(substitute(set))
+  
+  full_year <- set %>%
+    mutate(Year = as.character(Year),
+           median_price = ifelse(is.na(median_price), 0, median_price)) %>%
+    ggplot(aes(Month, median_price, colour = Year)) +
+    geom_line(size = 1.3, show.legend = F) +
+    facet_wrap(facets = "Year", scales = "free") +
+    scale_x_continuous(breaks = seq(1, 12, 1)) +
+    scale_y_continuous(labels = scales::dollar_format(prefix = "$")) +
+    labs(title = paste(name, "seat sales data from 2001-2013 by month: Prices vary from year to year"))
+  
+  month_year <- set %>%
+    mutate(Year = as.character(Year)) %>%
+    ggplot(aes(Month, median_price, colour = value_provenance)) +
+    geom_point(size = 2.5) +
+    facet_wrap(facets = "Year", scales = "free") +
+    scale_x_continuous(breaks = seq(1, 12, 1)) +
+    scale_y_continuous(labels = scales::dollar_format(prefix = "$")) +
+    scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+    theme(legend.position = "top") +
+    labs(title = paste(name, "seat sales data from 2001-2013 by month: Prices vary from year to year"),
+         subtitle = "Values are coloured to show which prices have been immputed")
+    
+  full_yr_impute <- set %>%
+    mutate(sale_month = seq(1, n(), 1)) %>%
+    ggplot(aes(sale_month, median_price, colour = value_provenance)) +
+    geom_point(size = 2.5, alpha = .5) +
+    scale_x_continuous(breaks = seq(1, 160, 10)) +
+    scale_y_continuous(labels = scales::dollar_format(prefix = "$")) +
+    scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+    labs(title = paste(name, "continuous time series seat sales data from 2001-2013: Prices vary from year to year"),
+         subtitle = "Values are coloured to show which prices have been immputed")
+  
+  if(viz == "full_year"){return(full_year)}
+  if(viz == "month_year"){return(month_year)}
+  if(viz == "full_yr_impute"){return(full_yr_impute)}
+  if(!viz %in% c("full_year", "month_year", "full_yr_impute")){
+    stop("Viz value is incorrect: Use 'full_year', 'month_year', or 'full_yr_impute'")
+  }
+}
+```
+
+####CME seat price focus
+
+Before starting the visualization work, I wanted to see how many imputed values the CME set has. The table below highlights about 14% of the CME values have been imputed.
+
+```{r imputation numbers for cme}
+cme_imputation %>%
+  count(value_provenance) %>%
+  mutate(percent_impute = round(n / sum(n), 2) * 100) %>%
+  custom_kable()
+```
+
+Moving into the CME seat sales series, I've used a faceted line plot so each year can be reviewed individually at the same time. The time series shows price variability with sales value peaking in winter 2008 and slowly declining thereafter. However, prices did not come back to 2001 levels so there is a broad, upward trend. 
+
+```{r cme viz 1}
+mercantile_viz(set = cme_imputation, viz = "full_year") +
+  labs(subtitle = "Seat price increases until a peak around winter 2008 followed by a decline")
+```
+
+Keeping with the same basic visualization approach, I've added in the marker for imputed points. The imputation points, highlighted in blue, seem reasonable and in line with the general yearly price trends. This lends further confirmation that the cleaning and summary work was done reasonably.
+
+```{r cme viz 2}
+mercantile_viz(set = cme_imputation, viz = "month_year")
+```
+
+As a final visualization, I'm reviewing the full series from 2001 to 2013. The series appears to have an upward trend, as previously mentioned, and possibly some seasonality, though only slight if so. Moreover, I think the sale prices are cyclical in nature and tied to wider economic performance. For example, the sale price drop takes place around the 2008 market crash and trends down into the great recession and subsequent recovery. With these factors in mind, it appears the series is non-stationary, though I'll work to confirm this using ACF plots and statistical testing.
+
+I also think the price drop may be associated with the rise of high-frequency trading following the financial crisis. During this period, exchanges generally encouraged higher volume trading using electronic methods to prop up their otherwise slow trading environment. I pointed out that the real advantages of a CME seats were accrued by floor participants and not electronic traders. In an expanding electronic age, this might have contributed to price declines. In the second part of the assignment, I'll review trading volumes and see if there is any statistical relationship but, this is an intuition moving into that work. 
+
+```{r cme viz 3}
+mercantile_viz(set = cme_imputation, viz = "full_yr_impute")
+```
+
+####IMM seat price focus
+
+The IMM set has a lower number of imputed values with only 6% needing the values added. 
+
+```{r imputation numbers for imm}
+imm_imputation %>%
+  count(value_provenance) %>%
+  mutate(percent_impute = round(n / sum(n), 2) * 100) %>%
+  custom_kable()
+```
+
+As a series, IMM seems to have similar beginnings to the CME set but, following a decline post-2008, the seat price falls to its lowest level in 2013. Generally, the prices here are less extreme than the CME set.
+
+```{r imm viz 1}
+mercantile_viz(set = imm_imputation, viz = "full_year") +
+  labs(subtitle = "Seat price increases until a peak around winter 2008 followed by a decline; lowest prices evident in 2013")
+```
+
+The initial imputation summary showed an strong number of original values, which can be seen here. Past 2001 and 2002, there are only five imputed values. I think this is positive from a forecasting perspective given there is more original data.  
+
+```{r imm viz 2}
+mercantile_viz(set = imm_imputation, viz = "month_year")
+```
+
+The final series visualization shows all prices since 2001. The IMM prices shows a very similar shape to the CME records. That said, I don't think there's any trend and probably not much seasonality either. The same cyclical aspect is clear and seems like the defining feature of both series.
+
+```{r imm viz 3}
+mercantile_viz(set = imm_imputation, viz = "full_yr_impute") + 
+  labs(subtitle = "Series shows major price increase from June to July 2007 (points 78 & 79")
+```
+
+####IOM seat price focus
+
+Concluding the secondary exploratory data analysis, I'll be looking at the IOM set. The initial review shows the IOM set has the same number of imputation values as the IMM set. As such, the CME has the largest number of imputed values.
+
+```{r imputation numbers for iom}
+iom_imputation %>%
+  count(value_provenance) %>%
+  mutate(percent_impute = round(n / sum(n), 2) * 100) %>%
+  custom_kable()
+```
+
+Much like the previous two series, IOM shows a steady upward trend until the post-2008 crash. Prices did not recover and fell as low as $50,000 in 2013. With nearly 100,000 price difference between 2001 and 2013, the series has a downward trend overall. 
+
+```{r iom viz 1}
+mercantile_viz(set = iom_imputation, viz = "full_year") +
+  labs(subtitle = "Seat price increases until a peak around winter 2008 followed by a decline; lowest prices evident in 2013")
+```
+
+This series appears very similar to the IMM set. The same price jump can be seen in June 2007. Most of the imputed values are concentrated in the first four years of price data with only three in the final nine years.
+
+```{r iom viz 2}
+mercantile_viz(set = imm_imputation, viz = "month_year")
+```
+
+The final series visualization shows all prices since 2001. Again, the cyclical nature of IOM seat prices is on display here.
+
+```{r iom viz 3}
+mercantile_viz(set = imm_imputation, viz = "full_yr_impute") + 
+  labs(subtitle = "Series shows major price increase from June to July 2007 (points 78 & 79")
+```
+
+***
+
+##Assignment 8
+
+***
+
+###Introduction and loading new data 
+
+With the CME data aggregated and imputed from the previous assignment, I'll work to conduct the time series analysis here while also forecasting 2013 seat prices. To enrich the previous work though, I'm also loading in two new sets with data on contract volumes by seat type alongside a more detailed review of commodity types being sold.
+
+```{r loading new data for contracts}
+contract_volumes <- read.csv("Contracts_Volume.csv", stringsAsFactors = F) %>%
+  mutate(Electronic.Volume = tm::removePunctuation(x = Electronic.Volume),
+         Electronic.Volume = as.numeric(Electronic.Volume),
+         Date = as.Date(Date,  format = "%m/%d/%Y"),
+         Year = year(x = Date),
+         Month = month(x = Date)) %>%
+  rename_all(tolower) %>%
+  rename_all(function(x) str_replace(string = x, 
+                                     pattern = "\\.", 
+                                     replacement = "_")) %>%
+  rename(product_desc = "product_short.desc") %>%
+  select(date, year, month, everything())
+
+trading_classes <- read.csv("Contracts_Classification.csv", stringsAsFactors = F) %>%
+  rename(commodity_indicator = Commodity.Code) %>%
+  rename_all(tolower) %>%
+  filter(division != "GEM")
+
+contract_volumes <- contract_volumes %>%
+  inner_join(x = ., y = trading_classes, by = "commodity_indicator")
+
+contract_volumes %>%
+  head() %>%
+  custom_kable()
+```
+
+***
+
+###Formating contract volumes data
+
+The ultimate goal for the analysis is producing accurate forecasts for seat prices in 2013. To do this well though, the model input values are important. Given the new volumes data will serve a predictors, choosing the most appropriate aggregation choice is essential.
+
+With this in mind, I'm going to try a few permutations and evaluate which format seems reasonable. In service of this goal, I'll preemptively build some initial models before the formal forecasting and exploratory data analysis sections so I have some indication of which aggregation choice should be selected.
+
+The first format is all the trading methods, options and futures, volumes aggregated by floor and electronic. Following this, I've added in the totals for each option. Below, I've included the first five rows from the full iom set with some of the new variables included. This is the highest level of aggregation for any of the format choices.
+
+```{r aggregating contract values}
+aggregate_contracts <- contract_volumes %>%
+  group_by(year, month, division, future_option) %>%
+  summarise(futures_elec = sum(electronic_volume),
+            futures_total = sum(total_volume),
+            futures_floor = futures_total - futures_elec) %>%
+  ungroup() %>%
+  filter(future_option == "O") %>%
+  select(-future_option)
+
+aggregate_contracts <- contract_volumes %>%
+  group_by(year, month, division, future_option) %>%
+  summarise(options_elec = sum(electronic_volume),
+            options_total = sum(total_volume),
+            options_floor = options_total - options_elec) %>%
+  ungroup() %>%
+  filter(future_option == "F") %>%
+  select(options_total, options_elec, options_floor) %>%
+  bind_cols(aggregate_contracts) %>%
+  arrange(year, month) %>%
+  filter(year >= 2001)
+
+aggregate_contracts <- aggregate_contracts %>% 
+  arrange(division) %>%
+  mutate(seat_price = c(cme_imputation$median_price,
+                        imm_imputation$median_price,
+                        iom_imputation$median_price),
+         total_floor = futures_floor + options_floor,
+         total_elec = futures_elec + options_elec,
+         total_cme = futures_total + options_total,
+         record = rep(1:nrow(cme_imputation), times = 3)) %>%
+  select(record, year, month, division, options_elec, options_floor, 
+         options_total, futures_elec, futures_floor, futures_total, 
+         total_floor, total_elec, total_cme, seat_price)
+
+cme_full <- aggregate_contracts %>%
+  filter(division == "CME")
+
+imm_full <- aggregate_contracts %>%
+  filter(division == "IMM")
+
+iom_full <- aggregate_contracts %>%
+  filter(division == "IOM")
+
+iom_full %>%
+  select(division, options_elec, options_floor, futures_elec, futures_floor,
+         total_floor, total_elec, total_cme) %>%
+  head() %>%
+  custom_kable()
+```
+
+To assess how these variables predict the 2013 seat prices, I'm using a multivariate linear model. Following the model development, I've done the 2013 prediction and saved it into a data frame which will house all the results from the various aggregation approaches. As a note, I've only included the options and futures volumes because the total causes singularities since they are just the other two variables added together. 
+
+```{r initial cme lm}
+train <- cme_full %>%
+  filter(year != 2013)
+
+holdout <- cme_full %>%
+  filter(year == 2013)
+
+cme_full_lm <- lm(seat_price ~ month + options_elec + options_floor +
+                    futures_elec + futures_floor, data = train)
+
+regression_results <- holdout %>%
+  mutate(full_agg_pred = predict(cme_full_lm, holdout)) %>%
+  select(seat_price, full_agg_pred)
+```
+
+The initial summary shows significant values for all the new volume variables with the exception of futures floor trading. Interestingly, this shows electronic futures being associated with price decreases but, electronic options being positively associated. I'm also slightly wary of seeing such a high p-value for futures floor volumes. I think these both might signal multicollinearity in the set.
+
+```{r initial cme model review 1}
+summary(cme_full_lm)
+```
+
+To formalize this intuition, I've created a variance inflation factor (VIF) table below. As suspected, there is extreme multicollinearity in the set. As a rule of thumb, VIF values over four should be noted while any VIF over 10 signals some correction might be needed. Electronic options has a VIF of about 19, so any modelling option here  has to rectify this.
+
+```{r initial cme model review 2}
+vif(mod = cme_full_lm) %>%
+  custom_kable()
+```
+
+Creating a new linear model using a stepwise approach helps correct this variance inflation issue, though some multicollinearity is still evident. Using this approach, futures option volumes have been dropped.
+
+```{r creating cme step}
+step_cme <- step(cme_full_lm, trace = F)
+
+vif(mod = step_cme) %>%
+  custom_kable()
+```
+
+Moving forward, I'll use this model in the final comparison. The final model only includes three volume predictors and month so the model does not have many terms.
+
+```{r updating regression table}
+regression_results <- holdout %>%
+  mutate(full_agg_pred = predict(step_cme, holdout)) %>%
+  select(seat_price, full_agg_pred)
+```
+
+The next few permutations include far more variables. These include:
+
+#####Full futures and options spread
+
+- Every individual futures and option volume included as individual column with a further split for floor and electronic: 104 columns
+
+#####All commodities without future and option spread
+
+- Includes every commodity traded split by floor and electronic: 54 columns
+
+#####All commodities aggregated
+
+- Includes every commodity aggregated without any further split: 29 columns
+
+As with the first model, I've used the stepwise approach for variable selection and used these to conduct the final predictions.
+
+```{r cme data split verification}
+#full spread by futures and options
+futures <- contract_volumes %>%
+  group_by(date, division, commodity_indicator) %>%
+  summarise(futures_elec = sum(electronic_volume),
+            futures_total = sum(total_volume),
+            futures_floor = futures_total - futures_elec) %>%
+  ungroup() %>%
+  select(-futures_total)
+
+f_floor_spread <- futures %>%
+  filter(division == "CME") %>%
+  select(commodity_indicator, futures_floor, date) %>%
+  spread(key = "commodity_indicator", value = "futures_floor") %>%
+  mutate_if(is.numeric, function(x) ifelse(is.na(x), 0, x)) %>%
+  rename_if(is.numeric, function(x) paste0(x, "_f_floor")) %>%
+  mutate(year = year(date),
+         month = month(date)) %>%
+  filter(year >= 2001)
+
+f_elec_spread <- futures %>%
+  filter(division == "CME") %>%
+  select(commodity_indicator, futures_elec, date) %>%
+  spread(key = "commodity_indicator", value = "futures_elec") %>%
+  mutate_if(is.numeric, function(x) ifelse(is.na(x), 0, x)) %>%
+  rename_if(is.numeric, function(x) paste0(x, "_f_elec")) %>%
+  mutate(year = year(date),
+         month = month(date)) %>%
+  filter(year >= 2001)
+
+options <- contract_volumes %>%
+  group_by(date, division, future_option, commodity_indicator) %>%
+  summarise(options_elec = sum(electronic_volume),
+            options_total = sum(total_volume),
+            options_floor = options_total - options_elec) %>%
+  ungroup() %>%
+  filter(future_option == "F") %>%
+  select(-future_option, -options_total)
+
+o_elec_spread <- options %>%
+  filter(division == "CME") %>%
+  select(commodity_indicator, options_elec, date) %>%
+  spread(key = "commodity_indicator", value = "options_elec") %>%
+  mutate_if(is.numeric, function(x) ifelse(is.na(x), 0, x)) %>%
+  rename_if(is.numeric, function(x) paste0(x, "_o_elec")) %>%
+  mutate(year = year(date),
+         month = month(date)) %>%
+  filter(year >= 2001)
+
+o_floor_spread <- options %>%
+  filter(division == "CME") %>%
+  select(commodity_indicator, options_floor, date) %>%
+  spread(key = "commodity_indicator", value = "options_floor") %>%
+  mutate_if(is.numeric, function(x) ifelse(is.na(x), 0, x)) %>%
+  rename_if(is.numeric, function(x) paste0(x, "_o_floor")) %>%
+  mutate(year = year(date),
+         month = month(date)) %>%
+  filter(year >= 2001)
+
+cme_commodities <- o_elec_spread %>%
+  inner_join(x = ., y = o_floor_spread, by = c("date", "month", "year")) %>%
+  inner_join(x = ., y = f_elec_spread, by = c("date", "month", "year")) %>%
+  inner_join(x = ., y = f_floor_spread, by = c("date", "month", "year")) %>%
+  mutate(cme_price = cme_full$seat_price) %>%
+  select(date, year, month, everything())
+
+train <- cme_commodities %>%
+  filter(year != 2013)
+
+holdout <- cme_commodities %>%
+  filter(year == 2013)
+
+cme_lm <- lm(cme_price ~ ., data = train[,-1])
+
+cme_step <- step(cme_lm, trace = F)
+
+regression_results <- regression_results %>%
+  mutate(all_comm_pred = predict(cme_step, holdout))
+
+#no future/option split
+all_commodities <- contract_volumes %>%
+  group_by(date, division, commodity_indicator) %>%
+  summarise(elec_volume = sum(electronic_volume),
+            total_volume = sum(total_volume),
+            floor_volume = total_volume - elec_volume) %>%
+  ungroup() %>%
+  select(-total_volume)
+
+floor_spread <- all_commodities %>%
+  filter(division == "CME") %>%
+  select(commodity_indicator, floor_volume, date) %>%
+  spread(key = "commodity_indicator", value = "floor_volume") %>%
+  mutate_if(is.numeric, function(x) ifelse(is.na(x), 0, x)) %>%
+  rename_if(is.numeric, function(x) paste0(x, "_floor")) %>%
+  mutate(year = year(date),
+         month = month(date)) %>%
+  filter(year >= 2001)
+
+elec_spread <- all_commodities %>%
+  filter(division == "CME") %>%
+  select(commodity_indicator, elec_volume, date) %>%
+  spread(key = "commodity_indicator", value = "elec_volume") %>%
+  mutate_if(is.numeric, function(x) ifelse(is.na(x), 0, x)) %>%
+  rename_if(is.numeric, function(x) paste0(x, "_elec")) %>%
+  mutate(year = year(date),
+         month = month(date)) %>%
+  filter(year >= 2001)
+
+cme_commodities <- floor_spread %>%
+  inner_join(x = ., y = elec_spread, by = c("date", "month", "year")) %>%
+  mutate(cme_price = cme_full$seat_price) %>%
+  select(date, year, month, everything())
+
+train <- cme_commodities %>%
+  filter(year != 2013)
+
+holdout <- cme_commodities %>%
+  filter(year == 2013)
+
+cme_lm <- lm(cme_price ~ ., data = train[,-c(1:3)])
+
+cme_step <- step(cme_lm, trace = F)
+
+regression_results <- regression_results %>%
+  mutate(future_option_pred = predict(cme_step, holdout))
+
+#totals-no future floor split
+all_commodities <- contract_volumes %>%
+  group_by(date, division, commodity_indicator) %>%
+  summarise(total_volume = sum(total_volume)) %>%
+  ungroup()
+
+total_spread <- all_commodities %>%
+  filter(division == "CME") %>%
+  select(commodity_indicator, total_volume, date) %>%
+  spread(key = "commodity_indicator", value = "total_volume") %>%
+  mutate_if(is.numeric, function(x) ifelse(is.na(x), 0, x)) %>%
+  mutate(year = year(date),
+         month = month(date)) %>%
+  filter(year >= 2001) %>%
+  mutate(seat_price = cme_full$seat_price) %>%
+  select(date, year, month, everything())
+
+train <- total_spread %>%
+  filter(year != 2013)
+
+holdout <- total_spread %>%
+  filter(year == 2013)
+
+cme_lm <- lm(seat_price ~ ., data = train[,-c(1:3)])
+
+cme_step <- step(cme_lm, trace = F)
+
+regression_results <- regression_results %>%
+  mutate(total_spread_pred = predict(cme_step, holdout))
+```
+
+With a model developed for each data format, I've compiled the prediction results below. I used Mean Absolute Percent Error (MAPE) to review which model provides the best predictions. As seen, the simple four term regression model has the lowest MAPE with a 26.7% average miss. While this result doesn't seem great, it does signal these are the bets predictors to carry forward. These will be used for the regression result but, also for an ARIMA with regression errors.
+
+```{r results comparison}
+data.frame(
+  model = names(regression_results)[2:5],
+  mape = c(
+    mape(actual = regression_results$seat_price, 
+         predicted = regression_results$full_agg_pred),
+    mape(actual = regression_results$seat_price, 
+         predicted = regression_results$all_comm_pred),
+    mape(actual = regression_results$seat_price, 
+         predicted = regression_results$future_option_pred),
+    mape(actual = regression_results$seat_price, 
+         predicted = regression_results$total_spread_pred)
+  )
+) %>% 
+  mutate_if(is.numeric, function(x) round(x, 3)) %>%
+  custom_kable()
+```
+
+***
+
+###Exploratory data analysis
+
+Beginning the exploratory section, I wanted to see each  time series for the futures and options volumes alongside price. I've logged the values so all the variables fit well on the same plot; otherwise, the volumes are far too large and obfuscate the price trends.
+
+Each volume series seems to have a positive association with seat price until the 2008 crash. After this time, the IMM and IOM seat prices more closely follow the volume drop, while the total CME volumes do not seem to conform to price drops. I think the IMM seat has the most congruent volume and price shapes.
+
+```{r volume totals and seat prices}
+aggregate_contracts %>%
+  select(record, seat_price, futures_total, options_total, division) %>%
+  gather(key = "variable", value = "value", -record, - division) %>%
+  mutate(value = log10(value)) %>%
+  ggplot(aes(record, value, colour = variable)) +
+  geom_line(size = 1.3) +
+  facet_wrap(facets =  "division", scales = "free") +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange", "darkorchid")) +
+  labs(title = "",
+       y = "log10 value")
+```
+
+One trends I was most interested in reviewing in this section is how price has changed with electronic trading volumes. Both the IMM and IOM seat prices do not seem as affected by the increase in electronic volumes. While there are price drops in line with the sharp rise in electronic trading, decreasing seat prices seem modest. In contrast, the CME seat appears to have a strong positive correlation between price and electronic volume until the 2008 financial crisis followed by a strong negative correlation thereafter. This conforms to my initial idea that the rise of electronic trading would adversely impact seat price because it offers less value to e-traders. That said, I still think there's a wider economic impact here that might be affecting these as well. 
+
+```{r electronic series with seat prices}
+aggregate_contracts %>%
+  select(record, seat_price, futures_elec, options_elec, division) %>%
+  gather(key = "variable", value = "value", -record, - division) %>%
+  mutate(value = sqrt(value)) %>%
+  ggplot(aes(record, value, colour = variable)) +
+  geom_line(size = 1.3) +
+  facet_wrap(facets =  "division", scales = "free") +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange", "darkorchid")) +
+  labs(title = "",
+      y = "sqrt value") +
+  labs(title = "Time series of exchange volumes and seat prices",
+       subtitle = "CME seat price seems to show negative correlation with electronic volumes post-2008")
+```
+
+I wanted to verify how the correlations between seat prices and volumes appeared for all the variables. For this, I've developed a correlation plot below for the price and volumes across all three seats. As seen in the last row, seat price seems to be negatively affected by all the volumes. 
+
+```{r total seat corrplot}
+aggregate_contracts %>%
+  select(-record, -year, -month, -division) %>%
+  cor() %>%
+  corrplot(method = "number", type = "lower")
+```
+
+I didn't pick this up in the initial plot so I also wanted to review each seat's correlations in isolation. The results of this are fascinating and highlight that each seat has a very different volume and seat price correlation when viewed individually than when aggregated. In fact, each seat shows a reversal when compared to the aggregate. This is an example of Simpson's Paradox, also called the Yule-Simpson effect, whereby a trend or relationship that is observed within several group reverses when the groups are combined (Berman et. al, 2012). The effect arises due to a confounding variable which skews the overall results. 
+
+Here, I think time is the confounding variable because there are different macroeconomic activities shaping the price and volume relationship over the series. This outside knowledge helps put the results in perspective. After seeing this plot, the simple correlations are likely not suitable for best understanding these volume and price trends. This also highlights why the initial regression results were not accurate. Going forward, I think one of the time series methods will be much more effective for the forecasting portion.
+
+```{r faceted seat correlation plot}
+CME_corrs <- aggregate_contracts %>%
+  filter(division == "CME") %>%
+  select(-record, -year, -month, -division) %>%
+  cor() %>%
+  as.data.frame() %>%
+  slice(10) %>%
+  mutate(seat = "CME")
+
+IOM_corrs <- aggregate_contracts %>%
+  filter(division == "IOM") %>%
+  select(-record, -year, -month, -division) %>%
+  cor() %>%
+  as.data.frame() %>%
+  slice(10) %>%
+  mutate(seat = "IOM")
+
+IMM_corrs <- aggregate_contracts %>%
+  filter(division == "IMM") %>%
+  select(-record, -year, -month, -division) %>%
+  cor() %>%
+  as.data.frame() %>%
+  slice(10) %>%
+  mutate(seat = "IMM")
+
+aggregate_contracts %>%
+  select(-record, -year, -month, -division) %>%
+  cor() %>%
+  as.data.frame() %>%
+  slice(10) %>%
+  mutate(seat = "Totals") %>%
+  rbind(CME_corrs, IOM_corrs, IMM_corrs) %>%
+  gather(key = "variable", value = "seat_price_cor", -seat) %>%
+  filter(variable != "seat_price") %>%
+  mutate(variable = reorder(variable, seat_price_cor),
+         pos_neg = ifelse(seat_price_cor < 0, "neg", "pos")) %>%
+  ggplot(aes(variable, seat_price_cor, fill = pos_neg)) +
+  geom_col(show.legend = F) +
+  coord_flip() +
+  facet_wrap(facets = "seat") +
+  scale_fill_manual(values = c("darkorange", "dodgerblue2")) +
+  labs(title = "Correlation between volume variables and exchange seat prices",
+       subtitle = "Negative correlation between total volume and price reverses when reviewed by individual seat; Example of Yule-Simpson Effect",
+       x = NULL)
+```
+
+Shifting focus to the seat prices, I wanted to investigate how the series autocorrelations appear. As a starting point, I've developed an ACF plot for each price series below. Not surprisingly, the series show strong signs of autocorrelation, which almost certainly means they are not stationary. Following the initial exploratory work, this seemed evident. 
+
+However, the autocorrelation pattern is interesting. My expectation for most series would be an exponential autocorrelation decay with levels falling below the significance after several lags. In this case, each seat price shows long memory correlations which don't dissipate until 18 lags or so. In fact, the CME price doesn't even drop below the significance threshold at all in 20 lags. This seems to indicate that a fractional differencing term might be an effective forecasting option for an ARIMA model. With this in mind, I'll use ARFIMA as one of the models.
+
+```{r acf plot for seat price}
+cme_acf <- ggAcf(x = cme_full$seat_price) +
+  labs(title = "ACF for CME seat price")
+
+imm_acf <- ggAcf(x = imm_full$seat_price) +
+  labs(title = "ACF for IMM seat price")
+
+iom_acf <- ggAcf(x = iom_full$seat_price) +
+  labs(title = "ACF for IOM seat price")
+
+grid.arrange(cme_acf, imm_acf, iom_acf, nrow = 1, 
+             top = "All seats prices show long memory residuals- Fractional arima may be a suitable model for these forecasts")
+```
+
+Adding more statistical validity to the stationary review, I've developed an Augmented Dickey–Fuller Test for each price series. As expected, the p-value results are all well above the .05 alpha threshold, so the test's null hypothesis cannot be rejected. This confirms that each series is non-stationary and therefore, will require some differencing.
+
+```{r all price adf test}
+data.frame(
+  seat = c("cme", "imm", "iom"),
+  adf_pvalue = c(
+    adf.test(x = cme_full$seat_price)$p.value,
+    adf.test(x = imm_full$seat_price)$p.value,
+    adf.test(x = iom_full$seat_price)$p.value
+  )
+) %>%
+  custom_kable()
+```
+
+***
+
+###Part 1: Forecasting model development
+
+With the exploratory work finished, I'll develop the forecasting models for each category's seat price. For this, I'll develop the following models:
+
+- Linear regression
+
+- Holt Winter's
+
+- ARIMA (Autoregressive Integrated Moving Average)
+
+- Seasonal ARIMA 
+
+- ARIMA with regression errors
+
+- Fractional ARIMA
+
+- GARCH (Generalized Autoregressive Conditional Heteroscedastic)
+
+Based on the initial analysis, I think the ARFIMA model's will do well given the long memory autocorrelation.
+
+I've also taken the same approach to the repetitive model building stage by creating a function so each seat forecast can be done with less coding. The function `mercantile_forecast` performs all the necessary data splits for training and test, develops seven models, and then returns forecast values with accuracy reviews as well. In the last few lines, I've put the function to use and conducted all the forecasting for each seat. 
+
+Of interest, I've elected to use the `Arima` function over `auto.arima` which means specifying the model order manually. To automate that process, I've used a combination of `cross2` and `map` to find the order permutation with the lowest AIC. I've also then arranged the values by low AR as well so the method skews towards picking most simplistic p-order models. The same basic approach is used for the seasonal order selection as well. 
+
+```{r modelling set up and fuction dev, warning=FALSE, message=FALSE, cache=TRUE}
+mercantile_forecast <- function(data, seat){
+  #creating necessary data sets
+  reg_train <- training <- data %>%
+    filter(year != 2013)
+  
+  reg_holdout <- training <- data %>%
+    filter(year == 2013)
+  
+  training <- data %>%
+    filter(year != 2013) %>%
+    select(seat_price) %>%
+    ts(data = ., frequency = 12)
+  
+  holdout <- data %>%
+    filter(year == 2013) %>%
+    select(seat_price) %>%
+    ts(data = ., frequency = 12)
+  
+  train_predictors <- aggregate_contracts %>%
+    filter(year != 2013 & division == seat) %>%
+    select(month, options_elec, options_floor, futures_elec)
+  
+  holdout_predictors <- aggregate_contracts %>%
+    filter(year == 2013 & division == seat) %>%
+    select(month, options_elec, options_floor, futures_elec)
+  
+  #regression
+  seat_lm <- lm(seat_price ~ month + options_elec + options_floor +
+                     futures_elec + futures_floor, data = reg_train)
+  
+  seat_lm <- step(seat_lm, trace = F)
+  
+  #hw
+  seat_hw <- hw(y = training)
+  
+  #arima
+  order_find <- list(
+    aicc = cross2(1:4, 1:7) %>%
+      map(~Arima(y =  training,  
+                 order = c(.x[[1]], 1, .x[[2]]))$aicc),
+    p = rep(1:4, times = 7),
+    q = rep(1:7, each = 4)
+  ) %>% 
+    map_dfr(unlist) %>%
+    select(p, q, aicc) %>%
+    arrange(p, aicc) %>%
+    slice(1:10)
+  
+  high_p <- order_find$p[1]
+  
+  high_q <- order_find$q[1]
+  
+  seat_arima <- Arima(y = training, 
+                       order = c(high_p, 1, high_q))
+  
+  #sarima
+  season_find <- list(
+    aicc = cross2(1:2, 1:2) %>%
+      map(~Arima(y =  training,  
+                 order = c(high_p, 1, high_q),
+                 seasonal = c(.x[[1]], 1, .x[[2]]))$aicc),
+    p = rep(1:2, times = 2),
+    q = rep(1:2, each = 2)
+  ) %>% 
+    map_dfr(unlist) %>%
+    select(p, q, aicc) %>%
+    arrange(p, aicc) %>%
+    slice(1:10)
+  
+  season_p <- season_find$p[1]
+  
+  season_q <- season_find$q[1]
+  
+  seat_sarima <- Arima(y = training, 
+                  order = c(high_p, 1, high_q),
+                  seasonal = c(season_p, 1, season_q))
+  
+  #arima with errors
+  arima_reg <- Arima(y = training, 
+                     order = c(high_p, 1, high_q),
+                     xreg = train_predictors)
+  
+  #arfima
+  seat_arfima <- arfima(y = training)
+  
+  #garch with arma order
+  garch_spec <- ugarchspec(
+    variance.model = list(model = "sGARCH", 
+                          garchOrder = c(1, 1)),
+    mean.model = list(armaOrder = c(1, 0), 
+                      include.mean = FALSE),
+    distribution.model = "norm"
+  )
+  
+  seat_garch <- ugarchfit(spec = garch_spec, 
+                           data = training)
+  
+  seat_forecast <- data.frame(
+    lm = predict(seat_lm, reg_holdout),
+    hw = forecast(seat_hw, h = 12)$mean,
+    arima = forecast(seat_arima, h = 12)$mean,
+    sarima = forecast(seat_sarima, h = 12)$mean,
+    reg_arima = forecast(arima_reg, h = 12, xreg = holdout_predictors)$mean,
+    arfima = forecast(seat_arfima, h = 12)$mean,
+    garch = ugarchforecast(fitORspec = seat_garch, 
+                           n.ahead = 12)@forecast$seriesFor %>% as.numeric(),
+    actual = holdout
+  ) %>% mutate_all(function(x) as.numeric(x))
+  
+  #train smape
+  train_lm_smape <- smape(actual = seat_lm$fitted.values, predicted = training)
+  train_hw_smape <- smape(actual = as.numeric(seat_hw$fitted), predicted = training)
+  train_arima_smape <- smape(actual = as.numeric(seat_arima$fitted), 
+                             predicted = training)
+  train_sarima_smape <- smape(actual = as.numeric(seat_sarima$fitted), 
+                              predicted = training)
+  train_reg_ar_smape <- smape(actual = as.numeric(arima_reg$fitted), 
+                              predicted = training)
+  train_arfima_smape <- smape(actual = as.numeric(seat_arfima$fitted), 
+                              predicted = training)
+  train_garch_smape <- smape(actual = seat_garch@fit$fitted.values, 
+                       predicted = training)
+
+  #test smape
+  lm_smape <- smape(actual = seat_forecast$lm, predicted = holdout)
+  hw_smape <- smape(actual = seat_forecast$hw, predicted = holdout)
+  arima_smape <- smape(actual = seat_forecast$arima, predicted = holdout)
+  sarima_smape <- smape(actual = seat_forecast$sarima, predicted = holdout)
+  reg_arima_smape <- smape(actual = seat_forecast$reg_arima, predicted = holdout)
+  arfima_smape <- smape(actual = seat_forecast$arfima, predicted = holdout)
+  garch_smape <- smape(actual = seat_forecast$garch, predicted = holdout)
+  
+  smape_compare <- data.frame(
+    model = c("lm", "hw", "arima", "sarima", "reg_arima", "arfima", "garch"),
+    train_smape = c(train_lm_smape,
+                    train_hw_smape,
+                    train_arima_smape,
+                    train_sarima_smape,
+                    train_reg_ar_smape,
+                    train_arfima_smape,
+                    train_garch_smape),
+    test_smape = c(lm_smape,
+                   hw_smape,
+                   arima_smape,
+                   sarima_smape,
+                   reg_arima_smape,
+                   arfima_smape,
+                   garch_smape)
+    ) %>% 
+    arrange(test_smape) %>%
+    mutate_if(is.numeric, function(x) round(x, 5) * 100)
+  
+  seat_model_output <- list(lm = seat_lm,
+                            hw = seat_hw,
+                            arima = seat_arima,
+                            sarima = seat_sarima,
+                            reg_arima = arima_reg,
+                            arfima = seat_arfima,
+                            garch = seat_garch,
+                            forecasts = seat_forecast,
+                            smape_compare = smape_compare,
+                            holdout = holdout)
+  
+  return(seat_model_output)
+  
+}
+
+cme_forecasts <- mercantile_forecast(data = cme_full, seat = "CME")
+
+imm_forecasts <- mercantile_forecast(data = imm_full, seat = "IMM")
+
+iom_forecasts <- mercantile_forecast(data = iom_full, seat = "IOM")
+```
+
+
+***
+
+###Part 2: Forecast evaluation
+
+With all the forecasts developed, I'll work to determine which method produces the best results for each seat. Forecast accuracy is being reviewed using Symmetric Mean Absolute Percentage Error (SMAPE), the formula for which is seen below:
+
+> absolute(actual - predicted) / (absolute(actual) + absolute(predicted))
+
+This ensures that the metric is bounded from 0 to 100. Using a traditional MAPE approach, the upper bound is infinite so this corrects that issue.
+
+Before the SMAPE review though, I wanted to visualize all the fitted and forecast values for each method per seat. For this, I've compiled all these values in separate data frames and then merged them together. This object can be used to develop a faceted grid where the results of each method can be seen for all the seats. Additionally, so I can get a feel for how accurate the forecasts might be, I've also included the actual values in this work as well.
+
+At first glance, the plot shows a lot of methods which produce reasonable looking forecasts. The outlier here appears to be all the linear models, which show very different series than the seat prices. Outside of those though, the time series models seem to show good fits. I think ARFIMA shows the most accurate fits for both CME and IMM while the ARIMA, Seasonal ARIMA, or ARIMA with regression errors looks best for IOM. In this seat, the ARFIMA option looks to have too sharp an upward trend, which deviates from the more curved price line. These are good starting points for understanding which method should be recommended for the final forecasting exercise. 
+
+```{r forecast method vis, fig.height=11.5, fig.width=11}
+cme_forecast_series <- data.frame(
+  seat = "CME",
+  record = rep(1:156, 8),
+  set = c(
+    rep("fitted", 144), rep("forecast", 12)
+  ),
+  model = rep(
+    c("lm", "hw", "arima", "sarima", "reg_arima", 
+      "arfima", "garch",  "actual"), each = 156
+  ),
+  price = c(
+    cme_forecasts$lm$fitted.values, cme_forecasts$forecasts$lm,
+    cme_forecasts$hw$fitted, cme_forecasts$forecasts$hw,
+    cme_forecasts$arima$fitted, cme_forecasts$forecasts$sarima,
+    cme_forecasts$sarima$fitted, cme_forecasts$forecasts$sarima,
+    cme_forecasts$reg_arima$fitted, cme_forecasts$forecasts$sarima,
+    cme_forecasts$arfima$fitted, cme_forecasts$forecasts$arfima,
+    cme_forecasts$garch@fit$fitted.values, cme_forecasts$forecasts$garch,
+    cme_full$seat_price
+  )
+)
+
+imm_forecast_series <- data.frame(
+  seat = "IMM",
+  record = rep(1:156, 8),
+  set = c(
+    rep("fitted", 144), rep("forecast", 12)
+  ),
+  model = rep(
+    c("lm", "hw", "arima", "sarima", "reg_arima", 
+      "arfima", "garch",  "actual"), each = 156
+  ),
+  price = c(
+    imm_forecasts$lm$fitted.values, imm_forecasts$forecasts$lm,
+    imm_forecasts$hw$fitted, imm_forecasts$forecasts$hw,
+    imm_forecasts$arima$fitted, imm_forecasts$forecasts$sarima,
+    imm_forecasts$sarima$fitted, imm_forecasts$forecasts$sarima,
+    imm_forecasts$reg_arima$fitted, imm_forecasts$forecasts$sarima,
+    imm_forecasts$arfima$fitted, imm_forecasts$forecasts$arfima,
+    imm_forecasts$garch@fit$fitted.values, imm_forecasts$forecasts$garch,
+    imm_full$seat_price
+  )
+)
+
+iom_forecast_series <- data.frame(
+  seat = "IOM",
+  record = rep(1:156, 8),
+  set = c(
+    rep("fitted", 144), rep("forecast", 12)
+  ),
+  model = rep(
+    c("lm", "hw", "arima", "sarima", "reg_arima", 
+      "arfima", "garch", "actual"), each = 156
+  ),
+  price = c(
+    iom_forecasts$lm$fitted.values, iom_forecasts$forecasts$lm,
+    iom_forecasts$hw$fitted, iom_forecasts$forecasts$hw,
+    iom_forecasts$arima$fitted, iom_forecasts$forecasts$sarima,
+    iom_forecasts$sarima$fitted, iom_forecasts$forecasts$sarima,
+    iom_forecasts$reg_arima$fitted, iom_forecasts$forecasts$sarima,
+    iom_forecasts$arfima$fitted, iom_forecasts$forecasts$arfima,
+    iom_forecasts$garch@fit$fitted.values, iom_forecasts$forecasts$garch,
+    iom_full$seat_price
+  )
+)
+
+rbind(cme_forecast_series, imm_forecast_series, iom_forecast_series) %>%
+  mutate(seat = factor(seat, levels = c("CME", "IMM", "IOM"))) %>%
+  ggplot(aes(record, price, colour = set)) +
+  geom_line(size = 1.3) +
+  facet_grid(seat ~ model, scales = "free") +
+  scale_colour_manual(values = c("dodgerblue2", "darkorange")) +
+  labs(title = "Forecasts from 7 models for CME, IMM, and IOM seat prices",
+       subtitle = "Visuliazation includes all train and forecast values; Arima class models appear to have close fits")
+```
+
+####CME model review
+
+Building off the visualization work, I'll be formally reviewing the training and test SMAPE's for each method. As one last visualization check, I've isolated the final forecast values for each method alongside the actual CME seat price in 2013. It appears that none of the methods pick up the sudden rise in the last few months of the year but, otherwise, the time series model's appear quite close. I still think the ARFIMA forecast sticks out given the more noticeable upward trend.
+
+```{r cme forecast viz}
+mercantile_forecast_viz <- function(data, by){
+  data %>%
+  filter(set == "forecast") %>%
+  ggplot(aes(record, price, colour = model)) +
+  geom_line(size = 1.3, alpha = .25) +
+  scale_y_continuous(labels = scales::dollar, breaks = seq(-500000, 2000000, by)) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1)))  
+}
+
+mercantile_forecast_viz(data = cme_forecast_series, by = 100000) +
+  labs(title = "CME seat forecast for 2013",
+       subtitle = "ARFIMA appears to have the most accurate forecast")
+```
+
+The table with all the forecast SMAPE values confirms this. ARFIMA has the lowest SMAPE, although only by a small margin over the ARIMA model (~1.1%). All the ARIMA variants do well here though, as does the GARCH model. The more simplistic Holt-Winter's method, which is an exponential smoothing forecast, provides the least accurate forecast.
+
+```{r cme smape review}
+cme_forecasts$smape_compare %>%
+  custom_kable()
+```
+
+With the top method identified, I wanted to do a more thorough model review. It appears that the differening term is .2, which is highly significant as per the low p-value. The model also incorporates two AR terms, which is standard since this is the default setting in the `arfima` function.
+
+```{r cme model summary for arfima}
+summary(cme_forecasts$arfima)
+```
+
+Examining the residuals, the ACF shows signs that there is no autocorrelation left in the series. There's one spike over the significance line but, over 36 lags, this isn't too surprising.  
+
+```{r residuals review for top cme model}
+checkresiduals(object = cme_forecasts$arfima)
+```
+
+To confirm the stationarity, I've included a Ljung-Box test for 36 lags (in line with the ACF plot). This provides statistical confirmation that the residual are stationary and without significant autocorrelation.
+
+```{r LB test for top cme model}
+Box.test(x = cme_forecasts$arfima$residuals, 
+         lag = 36, 
+         type = "Ljung-Box", 
+         fitdf = length(c(cme_forecasts$arfima$ar, 
+                          cme_forecasts$arfima$d,
+                          cme_forecasts$arfima$ma)) - 1)
+```
+
+
+####IMM model review
+
+The IMM price again appears close to the ARFIMA forecast. That said, the Holt-Winter's method seems close as well. I think the additional upward trend captured by the ARFIMA model likely makes it closer. The worst forecast here appears to be the linear model, which is over $100,000 higher than the actual price in several months. 
+
+```{r imm forecast viz}
+mercantile_forecast_viz(data = imm_forecast_series, by = 50000) +
+  labs(title = "IMM seat forecast for 2013",
+       subtitle = "ARFIMA appears to have the most accurate forecast")
+```
+
+As expected, the ARFIMA model does have the lowest SMAPE.
+
+```{r imm smape review}
+imm_forecasts$smape_compare %>%
+  custom_kable()
+```
+
+The summary shows the differencing term is slightly over 0 at .027. However, it isn't significant. I played around with different differencing terms using `fracdiff` but, ultimately couldn't improve upon the price forecast. As such, this three terms ARFIMA is my choice.
+
+```{r imm model summary for arfima}
+summary(imm_forecasts$arfima)
+```
+
+The IMM residuals appear stationary. There's one lag slightly over the significance level but, only by a small margin. There isn't much doubt here that the residuals will pass a statistical test.
+
+```{r residuals review for top imm model}
+checkresiduals(object = imm_forecasts$arfima)
+```
+
+As expected, the series has a high p-value in the Ljung-Box test indicating stationarity.
+
+```{r LB test for top imm model}
+Box.test(x = imm_forecasts$arfima$residuals, 
+         lag = 36, 
+         type = "Ljung-Box", 
+         fitdf = length(c(imm_forecasts$arfima$ar, 
+                          imm_forecasts$arfima$d,
+                          imm_forecasts$arfima$ma)) - 1)
+```
+
+####IOM model review
+
+Finishing up with the individual seats, the IOM forecast results are visualized below. This result isn't as clear as the previous seats. Notably, the ARIFMA forecast is far too high, so it doesn't appear to be the most accurate for the third seat. The lines are fairly clustered together but, I think SARIMA or ARIMA look the closest. Once again, the linear model is erratic and even produces negative values here. 
+
+```{r iom forecast viz}
+mercantile_forecast_viz(data = iom_forecast_series, by = 50000) +
+  labs(title = "IOM seat forecast for 2013",
+       subtitle = "Unclear which method has the most accurate forecast- sarima, reg_arima, and garch appear close though")
+```
+
+The SMAPE table confirms the seasonal ARIMA has the lowest value. The linear model has a SMAPE of about 93, which is only 7 points away from the highest possible value.
+
+```{r iom smape review}
+iom_forecasts$smape_compare %>%
+  custom_kable()
+```
+
+The model summary shows a high q value of 6. The remaining order values are all 1.
+
+```{r iom model summary for arfima}
+summary(iom_forecasts$sarima)
+```
+
+As with the other seats, the residuals show no autocorrelation. The ACF plot shows no lags even close to breaching the significance levels and the Ljung-Box confirms this with a very high p-value for the stationarity test.
+
+```{r residuals review for top iom model}
+checkresiduals(object = iom_forecasts$sarima)
+```
+
+####Final modelling results and recomendation
+
+Putting all the results together, I've made a final table with the best forecasting methods for each seat. An ARFIMA model showed the best results for both the CME and IMM seats while a seasonal ARIMA (1, 1, 6)(1, 1, 1) was the most appropriate for IOM. As such, these would be my modelling recommendations for the mercantile exchange.
+
+```{r final model review}
+rbind(cme_forecasts$smape_compare[1,],
+      imm_forecasts$smape_compare[1,],
+      iom_forecasts$smape_compare[1,]) %>%
+  mutate(seat = c("cme", "imm", "iom")) %>%
+  select(seat, model, train_smape, test_smape) %>%
+  custom_kable()
+```
+
+
+***
+
+###References
+
+####1. Berman et. al, "Simpson’s Paradox: a cautionary tale in advanced analytics"
+####Access: https://www.statslife.org.uk/the-statistics-dictionary/2012-simpson-s-paradox-a-cautionary-tale-in-advanced-analytics
+
+***

@@ -1,0 +1,256 @@
+---
+title: "Forecasting Beer Sales using Arima"
+author: "Mark Preston"
+date: "October 31, 2018"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+##Monthly beer forecasting
+
+***
+
+###Introduction: Loading data and introducing the analysis
+
+For this week's assignment, I'll be using arima models to forecast beer sales (sort of a dream come true here).
+
+```{r loading data and packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(forecast)
+library(tseries)
+library(TSA)
+library(knitr)
+library(kableExtra)
+
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+theme_set(
+  theme_minimal()
+)
+
+data("beersales")
+```
+
+***
+
+###Forecasting beer sales by month in 1990
+
+To start, I'm visualizing the series. The beer sales data spans from January 1975 to December 1990 during which there is a slight upward trend. There appears to be a strong seasonal aspect where sales peak in the summer and slow down in the winter. With this in mind, the series is almost certainly non-stationary.
+
+```{r vis for the time series, warning=FALSE, message=FALSE}
+autoplot(beersales) +
+  geom_line(size = 1.3, colour = "dodgerblue2") +
+  geom_vline(xintercept = 1990, size = 1.3, colour = "darkorange") +
+  scale_x_continuous(breaks = seq(1975, 1991, 2)) +
+  labs(title = "Monthly beer sales in millions of barrels, 01/1975 - 12/1990",
+       subtitle = "Forecast period will be all 12 months in 1990")
+```
+
+Before moving into the arima modelling, I'll formally test stationary. The ADF test shows a very low p-value indicating the series is not stationary. As such, I'll need to make sure the set is differenced.
+
+```{r adf test for beer, warning=FALSE, message=FALSE}
+adf.test(beersales)
+```
+
+For this portion, I'm splitting the set into train and test. The forecast will be for every month in 1990.
+
+```{r train and test split}
+beer_train <- window(x = beersales, end = c(1989, 12))
+
+beer_forecast <- window(x = beersales, start = c(1990, 1))
+```
+
+####Part 1 - use ARIMA(p,d,q) model to forecast beer sales for all months of 1990.
+
+As per the assignment, I'm starting with a non-seasonal arima. To develop this model, I'm using `auto.arima`, which yields a (4, 1, 1). The model looks like a good fit with the accuracy summary showing an average miss of about 4% (MAPE). 
+
+```{r beer arima dev}
+beer_auto <- auto.arima(beer_train, seasonal = F, 
+                        approximation = F, 
+                        stepwise = F)
+
+summary(beer_auto)
+```
+
+When reviewing, I'm not surprised to see autocorrelation in the residuals. The Ljung-Box shows a very low p-value confirming this. Of course, I noted that there appeared to be seasonality and the initial model is non-seasonal so there's likely more that can be done to correct for the residual autocorrelation going forward.
+
+```{r checking beer residuals}
+checkresiduals(beer_auto)
+```
+
+In a past week, I also tried to improve on the `auto.arima` model using a manual arima value process. I'll be following that approach again here using `cross2` and `map` so I can try different p and q permutations. I'll leave the d = 1 though.
+
+I've collected the top 10 permutations in a data frame, which is displayed below. The model p = 4 and q = 5 has a lower AICc than the p = 4 and q = 1 combination (which is ranked tenth here). 
+
+```{r checking for better arima fit}
+aicc_compare <- cross2(1:4, 1:7) %>%
+  map(~Arima(y =  beer_train,  
+             order = c(.x[[1]], 1, .x[[2]]))$aicc) %>%
+  data.frame() %>%
+  t() %>%
+  as.data.frame() %>%
+  mutate(AICc_combination = paste(rep(1:4, 7), "&", rep(1:7, each = 4))) %>%
+  rename(AICc = V1) %>%
+  select(AICc_combination, AICc) %>%
+  arrange(AICc) %>%
+  slice(1:10)
+
+aicc_compare %>%
+  custom_kable()
+```
+
+With the new low AICc values for p and q, I'm developing a new arima using a manual method. As the summary shows, the MAPE drops by about 1%.
+
+```{r developing custom beer arima}
+beer_manual_arima <- Arima(beer_train, order = c(4, 1, 5))
+
+summary(beer_manual_arima)
+```
+
+I'll forecast the 1990 sales volumes using both models so the test results can be compared. The initial plot shows both models with close fits to the actual values. This isn't too surprising since both had reasonably low accuracy metrics in training.
+
+```{r forecasting 1990 using non-seasonal}
+nonseasonal_auto <- forecast(beer_auto, h = 12)
+
+nonseasonal_manual <- forecast(beer_manual_arima, h = 12)  
+  
+autoplot(beersales) +
+  autolayer(nonseasonal_auto, series = "Auto_arima", PI = FALSE) +
+  autolayer(nonseasonal_manual, series = "High_AICc", PI = FALSE) +
+  geom_line(colour = "darkgray") +
+  labs(title = "Forecast for High AICc ARIMA model- Both models show close fit") +
+  guides(colour = guide_legend(title = "Forecast"))
+```
+
+The plot was slightly busy, so I'm developing accuracy tables for each set. To compare each, I've also aggregated each set of metrics into the print out. The accuracy table confirms the manual model is better, though not by a wide margin in test (4.3% vs 4.6% MAPE). With this, I'll be using the (4, 1, 5) model moving forward.
+
+```{r accuracy comparison for nonseasonal forecasts}
+accuracy_compare <- accuracy(nonseasonal_auto, beer_forecast) %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "Set") %>%
+  mutate(Model = "Auto_arima")
+
+accuracy_compare <- accuracy(nonseasonal_manual, beer_forecast) %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "Set") %>%
+  mutate(Model = "Manual_arima") %>%
+  bind_rows(accuracy_compare) %>%
+  select(Model, everything())
+
+accuracy_compare %>%
+  custom_kable()
+```
+
+####1A - Use the h-period in forecast() to forecast each month of 1990
+
+In this part, I'll reintegrate each monthly forecast back into the time series and then use the expanded set when making the next h = 1 forecast. For example, this means I would take the January 1990 forecast, save the value, combine it with the previous training set, and then make February.
+
+To start, I've constructed a new times series object to capture the values for the integrated forecast. Afterwards, I'm using a for loop that runs the function 11 times and saves the new forecast to the series. This ensures that each new value is forecast and then appended to the series.
+
+```{r integrated forecast development}
+integrated_series <- c(beer_train, nonseasonal_manual$mean[1]) %>%
+  as.ts()
+
+for (i in 1:11){
+  integrated_forecast <- Arima(integrated_series, order = c(4, 1, 5))
+  
+  month_forecast <- forecast(integrated_forecast, h = 1)
+  
+  integrated_series <- c(integrated_series, month_forecast$mean)
+}
+
+integrated_forecasts <- data.frame(Manual_arima = round(nonseasonal_manual$mean[1:12], 4)) %>%
+  mutate(Integrated = round(as.numeric(integrated_series[181:192]), 4),
+         Month = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "July", 
+                   "Aug", "Sep", "Oct", "Nov", "Dec"),
+         Actual = as.numeric(beer_forecast[1:12])) %>%
+  select(Month, everything())
+
+integrated_forecasts %>%
+  custom_kable()
+```
+
+####1C - which of the two above approaches yield the better results in terms of Mean Squared Error for 1990?
+
+When comparing each forecast's mean squared error (MSE), it's clear they are almost equal. In fact they are equivalent when rounded to 3 digits. The integrated model does have a slightly higher MSE making it a less desirable option but, the difference is likely negligible. My guess would be the additional error being added back in from each forecast value likely inflates the overall MSE (albeit marginally).
+
+```{r comparing mse}
+c(Integrated_mse = Metrics::mse(actual = integrated_forecasts$Actual, 
+                                predicted = integrated_forecasts$Integrated),
+  Arima_mse = Metrics::mse(actual = integrated_forecasts$Actual, 
+                           predicted = integrated_forecasts$Manual_arima)) %>%
+  custom_kable()
+```
+
+####Part 2 - use month of the year seasonal ARIMA(p,d,q)(P,Q,D)s model to forecast beer sales for all the months of 1990
+
+For this part, I'll switch to a seasonal arima and evaluate whether the change improves the 1990 forecast. The initial summary shows a model with lower MAPE than the previous non-seasonal arima model had in train.
+
+```{r developing seasonal arima, cache=TRUE}
+seasonal_beer <- auto.arima(beer_train, 
+                            seasonal = T, 
+                            approximation = F, 
+                            stepwise = F)
+
+summary(seasonal_beer)
+```
+
+The model coefficients still exhibit signs of significant autocorrelation as seen in the ACF plot and Ljung-Box results. It might not be possible to strip all residual autocorrelation in this case but, depending on how accurate the 1990 forecast is, the model might still be useful.
+
+```{r checking seasonal residuals}
+checkresiduals(seasonal_beer)
+```
+
+To check this, I've developed the forecast here. The plot shows a very close fit for the 1990 months.
+
+```{r seasonal forecast for 1990}
+seasonal_forecast <- forecast(seasonal_beer, h = 12)
+
+autoplot(beersales) +
+  autolayer(seasonal_forecast, series = "Seasonal_arima", PI = FALSE) +
+  geom_line(colour = "darkgray") +
+  labs(title = "Forecast for Seasonal arima model- values show close fit to actuals") +
+  guides(colour = guide_legend(title = "Forecast"))
+```
+
+As a final review in this part, I've put together accuracy metrics from all three models I put together. Despite having residual autocorrelation after the seasonal components were added, the final model performs better than each of the non-seasonal arima's. The test MAPE is just over 1% less than the manual arima I developed, which is large percentage drop given the values are small.
+
+```{r overall accuracy comparison}
+accuracy(seasonal_forecast, beer_forecast) %>% 
+  as.data.frame() %>% 
+  rownames_to_column(var = "Set") %>%
+  mutate(Model = "Seasonal_arima") %>%
+  bind_rows(accuracy_compare) %>%
+  select(Model, everything()) %>%
+  custom_kable()
+```
+
+####Part 3 - Which model (Part 1 or Part 2) is better to forecast beer sales for each month of 1990?
+
+I've already established the seasonal model has better overall accuracy metrics but, I'll check each forecast value here to see if the month-to-month breakdown. The seasonal model has a more accurate forecast in 11 of 12 months. Despite this, it's often a very small difference but, the seasonal model is still preferable.
+
+```{r monthly review}
+data.frame(
+  Month = c("Jan", "Feb", "Mar", "Apr", "May", 
+            "Jun", "July", "Aug", "Sep", "Oct", "Nov", "Dec"),
+  Actual = as.numeric(beer_forecast),
+  Nonseasonal = nonseasonal_manual$mean,
+  Seasonal = seasonal_forecast$mean
+) %>%
+  mutate(Nonseasonal_diff = abs(Actual - Nonseasonal),
+         Seasonal_diff = abs(Actual - Seasonal),
+         Best_method = ifelse(Seasonal_diff > Nonseasonal_diff, 
+                                     "Nonseasonal", "Seasonal")) %>%
+  select(Month, Actual, Seasonal, Seasonal_diff, 
+         Nonseasonal, Nonseasonal_diff, Best_method) %>%
+  custom_kable()
+```
+
+***

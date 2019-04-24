@@ -1,0 +1,400 @@
+---
+title: "Time Series Analysis of United Kingdom Economic Data"
+author: "Mark Preston"
+date: "October 17, 2018"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+##Using ARIMA and Regression to Evaluate UK GDP and Unemployment data
+
+***
+
+###Introduction: Loading data and introducing the analysis
+
+As always, I'll start by loading the necessary packages and data. For this analysis, I'm going to assess UK GDP and Unemployment levels for a given time period.
+
+```{r loading data, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(tseries)
+library(forecast)
+library(ggfortify)
+
+theme_set(
+  theme_minimal()
+)
+
+uk_econ <- read.csv("Unemployment_GDP_UK.csv", stringsAsFactors = F) %>%
+  rename(Year = "ï..Year")
+```
+
+***
+
+###Exploratory analysis and modelling set-up
+
+To start, I'm doing a basic summary for the data. As seen, the data spans from 1955-1969 through all four quarters. 
+
+```{r un econ str}
+summary(uk_econ)
+```
+
+I was interested in seeing how each set of values change over time so I visualized both in a faceted line plot. GDP has a slight, positive trend up over the sample. UN also shows  a positive trend but, is also coupled with what appears to be a cyclical aspect. Both would appear to be time dependent here so my guess would be they are each non-stationary series but, I'll work to review this.
+
+```{r exploratory data review}
+uk_econ %>%
+  gather(key = "variable", value = "value", -Year, -Quarter) %>%
+  ggplot(aes(Quarter, value, colour = variable)) +
+  geom_line(size = 2) +
+  facet_wrap(facets = "Year", nrow = 1) +
+  scale_colour_manual(values = c("darkorange", "dodgerblue2")) +
+  labs(title = "GDP & UN values from 1955-1969",
+       subtitle = "GDP has a positive trend while UN has a positive trend and cyclic appearance")
+```
+
+The previous visualization utilizes a regular data frame but, the object can be converted to time series. This assists with any visualization and also renders an object that can be used in the modelling phase. Given this, I'm making a time series object to use going forward.
+
+```{r time series construction and vis}
+uk_ts <- uk_econ %>%
+  select(-Year, -Quarter) %>%
+  ts(frequency = 4, start = c(1955, 1), end = c(1969, 4))
+
+autoplot(uk_ts) +
+  geom_line(size = 2) +
+  scale_colour_manual(values = c("darkorange", "dodgerblue2")) +
+  ggtitle("GDP & UN values from 1955-1969")
+```
+
+Prior to the time series modelling, I'm making the training and test set. For this analysis, I'll be forecasting each quarter for 1969; the remainder of the set will be used to train the models.
+
+```{r making train and test}
+uk_train <- window(uk_ts, end = c(1968, 4))
+
+uk_test <- window(uk_ts, start = c(1969, 1))
+```
+
+***
+
+###Forecasting GDP
+
+Before getting into model development, I have to select the appropriate forecasting method. The two options here are ARMA (autoregressive moving average) and ARIMA (autoregressive integrated moving average). One of the necessary conditions for ARMA models is having stationary data. The initial visualization seemed to show non-stationary data for both GDP and UN but, I'll check this using an Automated Dickey-Fuller test. The results show a high p-value, which confirms the data is non-stationary.
+
+```{r stationarity check}
+adf.test(uk_econ$GDP)
+```
+
+With this in mind, I'm going to develop an ARIMA model.
+
+####ARIMA Values
+
+- P is the order of the autoregressive component: 0
+-	D is the degree of first differencing involved: 1 (given non-stationarity)
+-	Q is the order of the moving average component: 0
+
+```{r arima model}
+(gdp_arima <- auto.arima(uk_train[,"GDP"], 
+                         seasonal = F, 
+                         stepwise = F, 
+                         approximation = F))
+```
+
+With the model constructed, I'm going to review how the forecast values compare to the actuals. As the plot shows, the fitted values look fairly congruent with the actuals. This is a good sign that the ARIMA model does a reasonable job forecasting GDP.
+
+```{r fitted vs actual plot, warning=FALSE}
+uk_econ %>%
+  slice(-57:-60) %>%
+  select(Year, Quarter, GDP) %>%
+  mutate(Fitted = gdp_arima$fitted) %>%
+  gather(key = "Variable", value = "value", -Year, -Quarter) %>%
+  ggplot(aes(Quarter, value, colour = Variable)) +
+  geom_line(size = 2, alpha = .5) +
+  facet_wrap(facets = "Year", nrow = 1) +
+  scale_colour_manual(values = c("darkorange", "dodgerblue2")) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  ggtitle("Fitted vs actuals for GDP values- Model shows close forecasts across all years")
+```
+
+As with any model, it's essential to review the residuals. The residuals look very small across time, which is expected given the previous plot showing such close fitted and actuals. The residual ACF shows no significant autocorrelations, although some of the lags are on the border. The residuals histogram looks broadly normal as well. Finally, the Ljung-Box test shows a high p-value which provides a formal statistical test to show there is no significant autocorrelation.
+
+```{r checking gdp residuals}
+checkresiduals(gdp_arima)
+```
+
+Looking at another accuracy metric, I've visualized how much each forecast was off by percentage to look at the relative miss for each point. This is derived from taking the forecast residual (actual - fitted) and dividing it by the actual values. Here, it's very clear that the model produces very good relative forecasts, with the largest miss being around .03%. While there isn't any baseline I have to reference for how good this is, it seems like a useful result.
+
+```{r mape gdp vis}
+uk_econ %>%
+  slice(-57:-60) %>%
+  mutate(fitted = gdp_arima$fitted,
+         Percent_miss = (GDP - fitted) / GDP) %>%
+  ggplot(aes(Quarter, Percent_miss)) +
+  geom_line(size = 2, alpha = .5, colour = "dodgerblue2") +
+  geom_hline(yintercept = 0, size = 1.5, alpha = .4, colour = "darkorange") +
+  facet_wrap(facets = "Year", nrow = 1) +
+  ggtitle("Percentage miss for each GDP forecast- values are very low")
+```
+
+The mean squared error (MSE) and root mean squared error (RMSE) can also be found below; they both show a very close fit. The total sum of squares erorr total (SSE) seems quite low here as well.
+
+```{r mse and rmse}
+c(sum_sq_error = sum(gdp_arima$residuals ^ 2),
+  mean_sq_error = mean(gdp_arima$residuals ^ 2),
+  RMSE = sqrt(mean(gdp_arima$residuals ^ 2)))
+```
+
+Looking forward, I've developed a forecast for all four quarters in 1969. The forecast follows the trend and show GDP rising for that year.
+
+```{r gdp forecast vis}
+autoplot(forecast(gdp_arima, h = 4)) +
+  labs(title = "GDP Forecast for all four quarters in 1969- Result shows steady, positive trend",
+       y = "GDP")
+```
+
+From this, it's important to review how accurate this forecast is. As seen, the accuracy metrics are broadly similar and only go down by small amounts between train and test. RMSE is included here again and also matches the value I manually derived, which is a good sign. Overall, this final review shows that the ARIMA model for GDP seems to provide a very sound forecasting method when applied one year out to 1969 numbers.
+
+```{r gdp accuracy metrics}
+accuracy(forecast(gdp_arima, h = 4), uk_test[,"GDP"])
+```
+
+***
+
+###Forecasting unemployment numbers (UN)
+
+I'll follow the same routine as I did for GDP for UN. This starts with checking stationarity to determine if I should use ARMA or ARIMA. As seen, the high p-value indicates the series is non-stationary, which means it needs to be differenced. ARIMA will be used as a result.
+
+```{r stationarity check for un}
+adf.test(uk_econ$UN)
+```
+
+####ARIMA Values
+
+- P is the order of the autoregressive component: 1
+-	D is the degree of first differencing involved: 1 (given non-stationarity)
+-	Q is the order of the moving average component: 0
+
+```{r arima model for un}
+(un_arima <- auto.arima(uk_train[,"UN"], 
+                        seasonal = F, 
+                        stepwise = F, 
+                        approximation = F))
+```
+
+As with before, I'm reviewing how close the fitted and actual values appear. Again, the model seems to do a good job forecasting the unemployment values. There are a few years where they appear less close (1957 for instance) but, overall they look fine.
+
+```{r fitted vs actual plot for un, warning=FALSE}
+uk_econ %>%
+  slice(-57:-60) %>%
+  select(Year, Quarter, UN) %>%
+  mutate(Fitted = un_arima$fitted) %>%
+  gather(key = "Variable", value = "value", -Year, -Quarter) %>%
+  ggplot(aes(Quarter, value, colour = Variable)) +
+  geom_line(size = 2, alpha = .5) +
+  facet_wrap(facets = "Year", nrow = 1) +
+  scale_colour_manual(values = c("darkorange", "dodgerblue2")) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  ggtitle("Fitted vs actuals for UN values- Model shows close forecasts across all years")
+```
+
+All the residual plots show normal, non-significantly autocorrelated residuals. The Ljung-Box test output confirms this with a high p-value, which signals that there is no significant autocorrelation.
+
+```{r checking un residuals}
+checkresiduals(un_arima)
+```
+
+The percentage miss plot verifies that the fitted values are close to the actuals. The highest percentage miss is only about .18%. Given that the unemployment numbers are more cyclical and erratic than GDP, this still seems okay.
+
+```{r mape un vis}
+uk_econ %>%
+  slice(-57:-60) %>%
+  mutate(fitted = un_arima$fitted,
+         Percent_miss = (UN - fitted) / UN) %>%
+  ggplot(aes(Quarter, Percent_miss)) +
+  geom_line(size = 2, alpha = .5, colour = "dodgerblue2") +
+  geom_hline(yintercept = 0, size = 1.5, alpha = .4, colour = "darkorange") +
+  facet_wrap(facets = "Year", nrow = 1) +
+  scale_y_continuous(breaks = seq(-1, 1, .05)) +
+  ggtitle("Percentage miss for each UN forecast- values are very low")
+```
+
+Again, the accuracy metrics are useful for getting a clear picture of how close the forecasts are. Below, the MSE and RMSE indicate relatively small misses by the ARIMA model. The SSE here is large though, which likely indictaes there are some notable outlier points that are very different from actual to forecast.
+
+```{r mse and rmse for un}
+c(sum_sq_error = sum(un_arima$residuals ^ 2),
+  mean_sq_error = mean(un_arima$residuals ^ 2),
+  RMSE = sqrt(mean(un_arima$residuals ^ 2)))
+```
+
+The forward looking portion shows that the forecast is a decreasing unemployment number for 1969.
+
+```{r un forecast vis}
+autoplot(forecast(un_arima, h = 4)) +
+    labs(title = "UN Forecast for all four quarters in 1969- Result shows slightly non-linear, negative trend",
+       y = "UN")
+```
+
+This forecast yields a mean absolute percentage error (MAPE) of about 4%. While the accuracy metrics are not decrease substantially from train to test, the mean error does rise by a large amount. Again, I don't have any baseline for comparison but, this seems like a good forecast given how varied the numbers are.
+
+```{r un accuracy metrics}
+accuracy(forecast(un_arima, h = 4), uk_test[,"UN"])
+```
+
+Given the jump in mean error (ME), I wanted to review each quarterly forecast. It appears that the Q3 and Q4 results are divergent from the actuals creating the large ME increase. Here, the unemployment numbers were higher than forecasted.
+
+```{r forecast vs actual review for un}
+data.frame(forecast = forecast(un_arima, h = 4)$mean,
+  actual = uk_test[,1])
+```
+
+***
+
+###Predicting GDP using linear regression
+
+So far, I've been using time series modelling to forecast GDP and unemployment numbers. However, linear regression can also be used. In this section, I'll use this method to predict GDP. This will be done using a simple OLS model with only one predictor (UN).
+
+Below, I've started by constructing a train and test set using the original data frame. From there, I've constructed the one-term model with GDP as the dependent variable. The linear model summary shows UN as a significant predictor for GDP. Counterintuitively, it shows that GDP increases by one unit for every .058 increase in UN. This positive association is unexpected but, given the model's simplicity, there's probably a lot missing. 
+
+I'm skeptical of the coefficient because a country's GDP is very complex and introducing more predictors might change this. It also doesn't pass a baseline intuition test given this seems to indicate as the unemployment numbers rise, so does the GDP. 
+The model does show a high R2 given there is only one predictor with UN explaining about 26% of the GDP variance. Still, this is a very low value from any practical standpoint which means the model isn't very good.
+
+As another note though, the upward trend is visible in the plot, so the result does seem plausible in this case.
+
+```{r gdp lm}
+lm_train <- uk_econ %>%
+  filter(Year != 1969)
+
+lm_test <- uk_econ %>%
+  filter(Year == 1969)
+
+gdp_lm <- lm(GDP ~ UN, data = lm_train)
+
+summary(gdp_lm)
+```
+
+Not surprisingly, the linear model shows a poor fit when looking at the actuals and fitted values. The fitted values aren't really close in any year with the exception of 1961. Otherwise, the value are divergent.
+
+```{r gdp lm fitted vs actual vis, warning=FALSE}
+lm_train %>%
+  select(Year, Quarter, GDP) %>%
+  mutate(Fitted = gdp_lm$fitted) %>%
+  gather(key = "Variable", value = "value", -Year, -Quarter) %>%
+  ggplot(aes(Quarter, value, colour = Variable)) +
+  geom_line(size = 2, alpha = .5) +
+  facet_wrap(facets = "Year", nrow = 1) +
+  scale_colour_manual(values = c("darkorange", "dodgerblue2")) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  ggtitle("Fitted vs actuals for linear regression GDP values- Model shows varied accuracy when comparing values")
+```
+
+With this in mind, I was expecting high prediction percentage misses, which is clear when looking at the plot below. Comparatively, this model does a much worse job forecasting the 1969 GDP levels than the ARIMA model. Again, I expected this given the ARIMA model includes more information to forecast on and is specifically designed for time series data. Here, the linear model only includes one predictor.
+
+```{r gdp lm percentage miss plot}
+lm_train %>%
+  mutate(fitted = gdp_lm$fitted,
+         Percent_miss = (GDP - fitted) / GDP) %>%
+  ggplot(aes(Quarter, Percent_miss)) +
+  geom_line(size = 2, alpha = .5, colour = "dodgerblue2") +
+  geom_hline(yintercept = 0, size = 1.5, alpha = .4, colour = "darkorange") +
+  facet_wrap(facets = "Year", nrow = 1) +
+  scale_y_continuous(breaks = seq(-1, 1, .05)) +
+  labs(title = "Percentage miss for each GDP forecast vary- Overall accurate but range from ~-20% to ~17%",
+       subtitle = "Linear regression appears to show a less reasonable fit when predicting GDP when compared to ARIMA")
+```
+
+Following up the plot, I've put together the final prediction for 1969. The percentage misses appear consistent with the training values and range from about 8.7% to about 10.26%.
+
+```{r gdp lm accuracy}
+(gdp_test <- lm_test %>%
+  select(-UN) %>%
+  mutate(prediction = predict(gdp_lm, lm_test),
+         residual = GDP - prediction,
+         percent_miss = round(residual / GDP, 3)))
+```
+
+The accuracy metrics still show a less than ideal fit. On the plus side, there is a stable drop from training to test. Realistically, these results aren't that bad since the model is so simplisitic but, linear regression doesn't appear to be the right statistical method for predicting GDP.
+
+```{r gdp lm accuracy metrics}
+c(Train_SSE = sum(gdp_lm$residuals ^ 2),
+  Train_MSE = mean(gdp_lm$residuals ^ 2),
+  Train_RMSE = sqrt(mean(gdp_lm$residuals ^ 2)),
+  Test_SSE = sum(gdp_lm$residuals ^ 2),
+  Test_MSE = mean(gdp_test$residual ^ 2),
+  Test_RMSE = sqrt(mean(gdp_test$residual ^ 2)))
+```
+
+***
+
+###Predicting Unemployment using linear regression
+
+I'll follow the same model review process here using GDP to predict unemployment. The summary shows the model is significant with a very low p-value. The slope coefficient highlights that for every one unit increase in unemployment, GDP rises by about 4.8 units. Again, this doesn't really conform to my intuition about how these might be related but, the model is simplistic.
+
+```{r un lm}
+un_lm <- lm(UN ~ GDP, data = lm_train)
+
+summary(un_lm)
+```
+
+Plotting the fitted versus actual values highlights a very poor model fit. The linear model captures the broad upward trend in the data but, doesn't account for the cyclical nature of unemployment numbers.  
+
+```{r un lm fitted vs actual vis, warning=FALSE}
+lm_train %>%
+  select(Year, Quarter, UN) %>%
+  mutate(Fitted = un_lm$fitted) %>%
+  gather(key = "Variable", value = "value", -Year, -Quarter) %>%
+  ggplot(aes(Quarter, value, colour = Variable)) +
+  geom_line(size = 2, alpha = .5) +
+  facet_wrap(facets = "Year", nrow = 1) +
+  scale_colour_manual(values = c("darkorange", "dodgerblue2")) +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) +
+  ggtitle("Fitted vs actuals for linear regression UN values- Model shows a poor fit")
+```
+
+This poor fit is further seen in the percentage miss plot. There is a wide range of misses that range from about -55% to 35%, both of which are substantially off. This really highlights how poor the fitted values are. The plot highlights how much better the ARIMA model picks up the cyclical nature of the unemployment numbers. Linear regression by definition picks up the upward trend here but, has no way of accounting for the varied unemployment cycles.
+
+```{r un lm percentage miss plot}
+lm_train %>%
+  mutate(fitted = un_lm$fitted,
+         Percent_miss = (UN - fitted) / UN) %>%
+  ggplot(aes(Quarter, Percent_miss)) +
+  geom_line(size = 2, alpha = .5, colour = "dodgerblue2") +
+  geom_hline(yintercept = 0, size = 1.5, alpha = .4, colour = "darkorange") +
+  facet_wrap(facets = "Year", nrow = 1) +
+  scale_y_continuous(breaks = seq(-1, 1, .1)) +
+  labs(title = "Percentage miss for each GDP forecast vary- Overall accurate but range from ~-55% to ~35%",
+       subtitle = "Linear regression appears to show a less reasonable fit when predicting UN when compared to ARIMA")
+```
+
+Since the model showed high variance between the fitted and actuals, I wanted to look at the residual plot as well. The output shows clear signs of heteroskedasticity with uneven residuals. This means the model isn't capturing some underlying pattern, which was evident in previous plots. As a result, the predictions vary and are unequal across the time series.
+
+```{r un lm residual review}
+autoplot(un_lm, which = 1)
+```
+
+To finalize this component, I've put together the 1969 predictions for unemployment. The percentage misses seems slightly lower than the training values and range from about 9.6% to about 13.2%.
+
+```{r un lm accuracy}
+(un_test <- lm_test %>%
+  select(-GDP) %>%
+  mutate(prediction = predict(un_lm, lm_test),
+         residual = UN - prediction,
+         percent_miss = round(residual / UN, 3)))
+```
+
+The accuracy metrics still show a poor fit but, they are better than training. Again, this is likely because of the cyclical unemployment numbers; in 1969 the values are in a cyclical stage where they are coming back down and therefore, happen to coincide with the broad upward trend from the model. Still, the model is fundamentally flawed and violates some of the assumptions of linear regression making it untenable as a forecasting choice.
+
+```{r un lm accuracy metrics}
+c(Train_SSE = sum(un_lm$residuals ^ 2),
+  Train_MSE = mean(un_lm$residuals ^ 2),
+  Train_RMSE = sqrt(mean(un_lm$residuals ^ 2)),
+  Test_SSE = sum(un_lm$residuals ^ 2),
+  Test_MSE = mean(un_test$residual ^ 2),
+  Test_RMSE = sqrt(mean(un_test$residual ^ 2)))
+```
+
+When comparing both the GDP and unemployment models, my guess would be GDP is the more appropriate dependent. It has much more accurate and stable predictions owing to an underlying pattern that is suitable for the linear regression model. A stable, positive trend can be modelled using OLS regression whereas a non-linear, cyclical trend is not well suited for the method.
+
+That said, there needs to be more outside context to decide which variable is ideally situated to be the outcome here. Situtationally, it might make sense to make either a dependent or predictor given a project's focus. Therefore, their respective coefficients and linear summaries do not inherently lend signs as to which one should normatively be the dependent variable. Overall though, the unemployment numbers display a structure that is not sutiable for a simple linear regression model making the GDP a more reasonable choice here.
+
+***

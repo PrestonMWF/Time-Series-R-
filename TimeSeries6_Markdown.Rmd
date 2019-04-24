@@ -1,0 +1,327 @@
+---
+title: "CO2 Forecasting for Gas Furnaces"
+author: "Mark Preston"
+date: "November 14, 2018"
+output: 
+  html_document: 
+    fig_height: 6.5
+    fig_width: 10.5
+---
+
+***
+
+##Forecasting methods using furnace CO2 emissions
+
+***
+
+###Introduction: Loading Data and Packages
+
+In this week's assignment, I'll be forecasting CO2 emissions percent using a variety of methods, including regression, various ARIMA models, and fraction ARIMA as well.
+
+```{r loading data and packages, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(forecast)
+library(car)
+library(knitr)
+library(kableExtra)
+
+theme_set(
+  theme_minimal()
+)
+
+custom_kable <- function(x){
+  kable(x, format = "html") %>%
+    kable_styling(bootstrap_options = "striped")
+}
+
+gas_furnace <- read.csv("Gas Furnace Dataset.csv") %>%
+  rename(CO2_percent = "Outlet.gas.CO2.percentage",
+         gas_rate = "Input.gas.rate")
+```
+
+***
+
+###Exploratory Data Analysis
+
+To start, I've plotted both variable using a faceted histograms. Each variable is approximately normal, although the density line highlights not perfectly. The dependent variable is CO2 percentage, which is the gas emissions output from a furnace. The values, which are percentages, range from about 45% to 61%. The predictor is input gas rate, which ranges from about -2.7 to 2.8.
+
+```{r univariate plots}
+gas_furnace %>%
+  gather(key = "variable", value = "value") %>%
+  ggplot(aes(value, ..density..)) +
+  geom_histogram(aes(fill = variable), bins = 35, show.legend = F) +
+  geom_density(colour = "darkgray", size = 1.5, show.legend = F) +
+  facet_wrap(facets = "variable", scales = "free") +
+  scale_fill_manual(values = c("darkorange", "dodgerblue2")) +
+  labs(title = "Histogram of both variables for forecasting- Gas CO2 percentage is dependent variable",
+       subtitle = "Each distribution has a broadly normal shape with some deviation")
+```
+
+Given some of the modelling will use regression, I'm going to evaluate how the outcome varies with the predictor here. As seen below, the CO2 percentage goes down as the gas rate increases. The regression line seems to show a medium strength negative correlation. While there is a downward trend, the points are not tightly concentrated around the line which signals a weaker correlation. 
+
+```{r scatterplot for variables}
+gas_furnace %>%
+  ggplot(aes(gas_rate, CO2_percent)) +
+  geom_jitter(size = 2, alpha = .5, colour = "dodgerblue2") +
+  geom_smooth(method = "lm", colour = "darkorange", se = F, size = 1.3) +
+  scale_x_continuous(breaks = seq(-4, 4, .5)) +
+  labs(title = "Scatterplot for CO2 percent vs gas rate",
+       subtitle = "Relationship appears to have a medium strength negative correlation")
+```
+
+I wanted to check the correlation coefficient between the two variables to better gauge the association strength. At -.484, it is around medium strength as the plot seemed to show. Given this, I would expect the regression slope coefficient for gas rate in the linear model to be negative and likely significant as well.
+
+```{r checking correlation}
+gas_furnace %>%
+  cor() %>%
+  round(3) %>%
+  custom_kable()
+```
+
+From a time series perspective, I've included all the record furnace events from start to finish here. The same negative correlation is noticeable at certain events in the series. Overall, I don't see any trend but, there might be some seasonality; the low and high points seem to have some structure.
+
+```{r time series plot for variables}
+gas_furnace %>%
+  mutate(event = seq(1, n(), 1)) %>%
+  gather(key = "variable", value = "value", -event) %>%
+  ggplot(aes(event, value, colour = variable)) +
+  geom_line(size = 1.3, show.legend = F) +
+  facet_wrap(facets = "variable", scales = "free", ncol = 1) +
+  scale_x_continuous(breaks = seq(1, 300, 25)) +
+  scale_colour_manual(values = c("darkorange", "dodgerblue2")) +
+  labs(title = "Time series plot for CO2 percent and gas rate over 296 events",
+       subtitle = "Relationship appears to have a medium strength negative correlation- Noticeable around events 13, 115, and 202")
+```
+
+As a final check before modelling, I'll review the series for stationarity. The initial visualizations seem to indicate the series might not be stationary. Adding to this further, the ACF plot shows heavy autocorrelation until lag 17. However, the autocorrelation is not decreasing exponentially and only slowly dissipates. This indicates the CO2 percent has long-memory residuals, which might require a fractional differencing method in place of a standard ARIMA approach. 
+
+```{r acf on co2 percent}
+gas_furnace %>%
+  select(CO2_percent) %>%
+  ggAcf() +
+  labs(title = "ACF plot for CO2 Percent shows long-memory residuals",
+       subtitle = "Series may need fractional differencing")
+```
+
+***
+
+###Time series Modelling
+
+Moving into the modelling phase, I'll develop a range of forecasting solutions. These include both ARIMA and a Fractional ARIMA (ARFIMA). 
+
+####Linear regression model
+
+As a starting point, I'll develop a simple linear model with CO2 percent as the outcome and gas rate as the predictor. The summary shows a significant negative slope coefficient for gas rate. This was something I expected following the EDA. Overall, the model is also significant with an R2 of .23. While this is low, it essentially means gas rate alone explains about 23% of the CO2 emissions.
+
+```{r furnace regression}
+co2_lm <- lm(CO2_percent ~ gas_rate, data = gas_furnace)
+
+summary(co2_lm)
+```
+
+When examining the residuals with an ACF plot, it's clear there is some autocorrelation. The first four lags are significant and decay exponentially afterwards. There's also some light fluctuations in the residuals which usually signals some seasonality. Overall though, the errors signal that the model is not stationary. 
+
+```{r simple regression acf}
+as.data.frame(co2_lm$residuals) %>%
+  ggAcf() +
+  labs(title = "ACF for CO2 model regression residuals (CO2 Percent ~ Gas Rate)",
+       subtitle = "Plot shows correlation decreasing exponentially in first 4 lags- some light seasonality exists given fluctuations")
+```
+
+Looking further at the residuals, the time series plot shows there is evident pattern. Ideally, the residuals should resemble white noise but, do not here. As such, I still think there are options to improve the model. 
+
+```{r linear model residuals over time}
+as.data.frame(co2_lm$residuals) %>%
+  mutate(events = seq(1, n(), 1)) %>%
+  ggplot(aes(events, co2_lm$residuals)) +
+  geom_line(size = 1.3, colour = "dodgerblue2") +
+  geom_hline(yintercept = 0, size = 1.3, colour = "darkorchid") +
+  labs(title = "Residual time series plot for CO2 model regression residuals (CO2 Percent ~ Gas Rate)",
+       subtitle = "Plot shows time period affects model accuracy; series does not resemble white noise")
+```
+
+####Develop ARIMA models for: (0,0,1), (1,0,0), (0,0,2), (2,0,0), and (2, 0, 2). Include external regressor for gas rate and plot the residuals for each.
+
+The next series of models will be various ARIMA permutations with p and q adjusted. As an additional parameter, each will contain the predictor values for gas rate. Since I need to develop five models with broadly the same construct, I'm creating a function so each arima can be run and saved into one list. I'm combining the function with `map2` so the various p and q permutations can be sent to the `model_collect` function.
+
+With each model now saved in a list, I can extract each ARIMA's residuals at one time for visualization. As seen, the faceted line plot shows the residual series for each model. Notably, the models seem to move towards stationarity as the plot moves from top to bottom. Both (2,0,0) and (2,0,2) seem most akin to white noise, and therefore stationary, although this will need statistical verification. The (2,0,2) model also has the most narrow range of residuals indicating it likely has the best fit as well.
+
+```{r collecting all arma residuals}
+model_collect <- function(y, p, q){
+  model <- Arima(y = y, 
+                 order = c(p, 0, q), 
+                 xreg = gas_furnace$gas_rate)
+  
+  model_components <- list(arima = model)
+  
+  return(model_components)
+}
+
+arima_p <- list(0, 1, 0, 2, 2)
+
+arima_q <- list(1, 0, 2, 0, 2)
+
+modelling_output <- map2(
+  arima_p, 
+  arima_q, 
+  function(p, q) model_collect(y = gas_furnace$CO2_percent, 
+                               p = p,
+                               q = q)
+  )
+
+models <- c("ARIMA(0,0,1)", 
+            "ARIMA(1,0,0)", 
+            "ARIMA(0,0,2)", 
+            "ARIMA(2,0,0)", 
+            "ARIMA(2,0,2)")
+
+map(1:5, function(x) modelling_output[[x]]$arima$residuals) %>%
+  unlist() %>%
+  as.data.frame() %>%
+  mutate(model = rep(models, each = nrow(gas_furnace)),
+         model = factor(model, levels = models), 
+         event = rep(seq(1, nrow(gas_furnace), 1), times = 5)) %>%
+  rename(residuals = ".") %>%
+  select(model, event, residuals) %>%
+  ggplot(aes(event, residuals, colour = model)) +
+  geom_line(size = 1.3, show.legend = F) +
+  facet_wrap(facets = "model", scales = "free", ncol = 1) +
+  labs(title = "Residuals for xreg arima models with different combinations for p and q",
+       subtitle = "ARIMA(2,0,2) appear to have residuals most resembling white noise")
+```
+
+####Develop a fractional ARIMA model for the output gas CO2% - Plot the residuals, acf and pacf
+
+As I suggested following the initial ACF plot of CO2 percent, the outcome variable here seems to have long memory. To adjust for this, a fractional differencing can be used. To do so, I'm relying on the `arfima` function.
+
+Both the residuals and ACF plot seem to indicate stationarity, although it's probably close given a few lags broaching significant autocorrelation.
+
+```{r developing arfima model}
+co2_arfima <- arfima(y = gas_furnace$CO2_percent)
+
+checkresiduals(co2_arfima$residuals)
+```
+
+Much like the ACF plot, the PACF shows a few lags with significant autocorrelation. However, it's less noted outside of the spikes so the series as a whole might pass a portmanteau statistical test. 
+
+```{r pacf plot}
+as.data.frame(co2_arfima$residuals) %>%
+  ggPacf() +
+  labs(title = "PACF plot for ARFIMA model- Residuals have some autocorrelation",
+       subtitle = "Portmanteau test needed to verify stationarity")
+```
+
+To verify this, I'm using a Ljung-Box test with 25 lags (same number of both ACF/PACF plot). Using this lag number, the residuals have just above the usual significance level of .05. The strength of evidence here is borderline but, I think it's reasonable to suggest the model is stationary.
+
+```{r arfima LB test}
+Box.test(x = co2_arfima$residuals, lag = 25, type = "Ljung-Box")
+```
+
+####Perform Summaries, Durbin-Watson and Box-Ljung tests for each model and build table to compare components
+
+#####ARIMA (0,0,1)
+
+For each model, I'll do a summary while also using `checkresiduals` to develop an ACF plot and Ljung-Box test. The Durbin-Watson will be included in the final table. The summary includes the usual ARIMA components but, also has a coefficient for the regression term. As a comparison, the rate rate coefficient is slightly less than the original linear model (-1.446 vs -1.343). 
+
+```{r summary for model 1}
+summary(modelling_output[[1]]$arima)
+```
+
+Both the ACF plot and Ljung-Box test show quite clearly that there is still autocorrelation in the residuals using this model.
+
+```{r residual check for model 1}
+checkresiduals(modelling_output[[1]]$arima, lag = 25)
+```
+
+#####ARIMA (1,0,0)
+
+This model shows a large drop in AIC from over 1000 to about 641. The gas rate coefficient also changes sign and becomes positive.
+
+```{r summary for model 2}
+summary(modelling_output[[2]]$arima)
+```
+
+As with the previous model, the ACF plot and Ljung-Box test show that there is still autocorrelation in the residuals.
+
+```{r residual check for model 2}
+checkresiduals(modelling_output[[2]]$arima, lag = 25)
+```
+
+#####ARIMA (0,0,2)
+
+This model produces an AIC between second and first model and also shows a return to a negative gas coefficient. The increase in AIC makes me think the p term will likely drive a better model fit.
+
+```{r summary for model 3}
+summary(modelling_output[[3]]$arima)
+```
+
+Through three models, none have show an absence of autocorrelation when evaluating the the ACF plot and Ljung-Box tests.
+
+```{r residual check for model 3}
+checkresiduals(modelling_output[[3]]$arima, lag = 25)
+```
+
+#####ARIMA (2,0,0)
+
+This model produces an AIC that again shows a major drop. The previous low AIC was from the (1,0,0) model with about 641 while this iteration shows 274. The MAPE here also is below 1% indicating a very strong fit in train. 
+
+```{r summary for model 4}
+summary(modelling_output[[4]]$arima)
+```
+
+Despite the improvement, there is still evident autocorrelation. The ACF plot shows the residuals are definitely closer to stationarity but, the portmanteau test still has a small p-value.
+
+```{r residual check for model 4}
+checkresiduals(modelling_output[[4]]$arima, lag = 25)
+```
+
+#####ARIMA (2,0,2)
+
+Finally, the last model shows the smallest AIC and generally, shows the best accuracy metrics as well. The gas rate coefficient is almost zero, though is slightly positive.
+
+```{r summary for model 5}
+summary(modelling_output[[5]]$arima)
+```
+
+The ACF shows the autocorrelation in the residuals is minimal but, the model still has a p-value under the normal alpha. Despite this, the test is fairly close and is definitely the best fit in the initial five ARIMA models.
+
+```{r residual check for model 5}
+checkresiduals(modelling_output[[5]]$arima, lag = 25)
+```
+
+####Final Comparison Table: Which ARIMA is closest to white noise?
+
+The final table reaffirms that the (2,0,2) ARIMA is the best model fit amongst the first five models. The Ljung-Box p-value is actually above the alpha threshold here given the `Box.test` version has slightly different parameters. All said though, this shows it is the preferable choice. Put together with the ACF and residuals plots, this solidifies (2,0,2) as the model with residuals closest to white noise.
+
+The new addition here is the Durbin-Watson test, which is another autocorrelation test. The main drawback with the approach is the test statistic is taken at lag = 1 so it doesn't acconut for any autocorrelation present across the whole series (like a portmanteau test). 
+
+The R function takes in a linear model object and returns a statistical test summary with a value an p-value. Since the arima objects here do not pass to the funciton, I've turned the residuals into vector to extract the DW value. While the result does not include a p-value, the DW values close to two signal that there is likely no autocorrelaiton in the the (2,0,2) and ARFIMA models. Overall, the all the values are between zero and two which further indicates there is positive autocorrelation as well.    
+
+The ARFIMA model comparison is difficult because it does not have the same differencing level and therefore, a direct AIC comparison is inadvisable. Overall though, it also passes the Ljung-Box test and shows stationarity making it a viable option. In a business setting, I would use the top ARIMA and ARFIMA to forecast a series and see which one did better on a holdout sample to confirm my choice.
+
+```{r reviewing all arima model components, warning=FALSE}
+list(
+  model = models,
+  aic = map(1:5, function(x) modelling_output[[x]]$arima$aic),
+  bic = map(1:5, function(x) modelling_output[[x]]$arima$bic),
+  durbin_watson = map(1:5, function(x)  durbinWatsonTest(
+    model =  as.vector(modelling_output[[x]]$arima$residuals)
+    )),
+  ljung_box = map(1:5, function(x) Box.test(modelling_output[[x]]$arima$residuals,
+                                            lag = 25,
+                                            type = "Ljung-Box")[3])
+  ) %>%
+map_df(unlist) %>%
+  bind_rows(
+    data.frame(model = "ARFIMA", 
+               aic = AIC(co2_arfima),
+               bic = BIC(co2_arfima),
+               durbin_watson = durbinWatsonTest(as.vector(co2_arfima$residuals)),
+               ljung_box = as.numeric(Box.test(co2_arfima$residuals, 
+                                               lag = 25, 
+                                               type = "Ljung-Box")[3]))
+  ) %>%
+  custom_kable()
+```
+
+***
